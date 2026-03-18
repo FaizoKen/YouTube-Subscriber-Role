@@ -1,4 +1,5 @@
 /private
+.claude/
 
 # Rust
 /target/

@@ -16,8 +16,6 @@ A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assi
 - **SQLx** — async, compile-time checked SQL
 - **Tokio** — async runtime with background workers
 
-Targets a single **$4-6/month VPS** (128MB app + 256MB database).
-
 ## Setup
 
 ### Prerequisites
@@ -68,40 +66,40 @@ cargo run
 
 ### RoleLogic Plugin (called by RoleLogic dashboard)
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/register` | Acknowledge role link creation |
-| `GET` | `/config` | Return config form schema |
-| `POST` | `/config` | Save YouTube Channel ID |
-| `DELETE` | `/config` | Clean up on role link deletion |
+| Method   | Path        | Purpose                        |
+| -------- | ----------- | ------------------------------ |
+| `POST`   | `/register` | Acknowledge role link creation |
+| `GET`    | `/config`   | Return config form schema      |
+| `POST`   | `/config`   | Save YouTube Channel ID        |
+| `DELETE` | `/config`   | Clean up on role link deletion |
 
 ### User Verification
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/verify` | Verification page (HTML) |
-| `GET` | `/verify/login` | Discord OAuth redirect |
-| `GET` | `/verify/callback` | Discord OAuth callback |
-| `GET` | `/verify/youtube` | Google OAuth redirect |
-| `GET` | `/verify/youtube/callback` | Google OAuth callback |
-| `GET` | `/verify/status` | Current link status (JSON) |
-| `POST` | `/verify/unlink` | Unlink account |
+| Method | Path                       | Purpose                    |
+| ------ | -------------------------- | -------------------------- |
+| `GET`  | `/verify`                  | Verification page (HTML)   |
+| `GET`  | `/verify/login`            | Discord OAuth redirect     |
+| `GET`  | `/verify/callback`         | Discord OAuth callback     |
+| `GET`  | `/verify/youtube`          | Google OAuth redirect      |
+| `GET`  | `/verify/youtube/callback` | Google OAuth callback      |
+| `GET`  | `/verify/status`           | Current link status (JSON) |
+| `POST` | `/verify/unlink`           | Unlink account             |
 
 ### Health
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/health` | Health check |
+| Method | Path      | Purpose      |
+| ------ | --------- | ------------ |
+| `GET`  | `/health` | Health check |
 
 ## Refresh Timing
 
 The plugin checks subscription status periodically, scaled by user count and YouTube API quota (default 10,000 units/day):
 
 | Users | Active Check Interval | Inactive Check Interval |
-|-------|----------------------|------------------------|
-| 1-5 | 30 min | 3 hours |
-| 100 | ~14 min | ~1.4 hours |
-| 1,000 | ~2.4 hours | ~14.4 hours |
+| ----- | --------------------- | ----------------------- |
+| 1-5   | 30 min                | 3 hours                 |
+| 100   | ~14 min               | ~1.4 hours              |
+| 1,000 | ~2.4 hours            | ~14.4 hours             |
 
 Active users (those with an assigned role) are checked **6x more frequently**.
 

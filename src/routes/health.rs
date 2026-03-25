@@ -17,22 +17,17 @@ pub async fn favicon() -> impl IntoResponse {
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let start = std::time::Instant::now();
-    let row = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM linked_accounts")
+    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&state.pool)
-        .await;
+        .await
+        .is_ok();
     let db_latency = start.elapsed().as_millis() as u64;
-
-    let (db_ok, total_users) = match row {
-        Ok(count) => (true, count),
-        Err(_) => (false, 0),
-    };
 
     let status = if db_ok { "healthy" } else { "degraded" };
 
     Json(json!({
         "status": status,
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "total_users": total_users,
         "checks": {
             "database": {
                 "status": if db_ok { "up" } else { "down" },

@@ -16,6 +16,7 @@ pub async fn favicon() -> impl IntoResponse {
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let start = std::time::Instant::now();
     let row = sqlx::query_as::<_, (i64, i64)>(
         "SELECT \
            (SELECT COUNT(*) FROM linked_accounts), \
@@ -23,15 +24,24 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     )
     .fetch_one(&state.pool)
     .await;
+    let db_latency = start.elapsed().as_millis() as u64;
 
     let (db_ok, total_verified, total_plugins) = match row {
         Ok((verified, plugins)) => (true, verified, plugins),
         Err(_) => (false, 0, 0),
     };
 
+    let status = if db_ok { "healthy" } else { "degraded" };
+
     Json(json!({
-        "status": if db_ok { "healthy" } else { "degraded" },
-        "database": db_ok,
+        "status": status,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "checks": {
+            "database": {
+                "status": status,
+                "latency_ms": db_latency
+            }
+        },
         "total_verified": total_verified,
         "total_plugins": total_plugins,
     }))

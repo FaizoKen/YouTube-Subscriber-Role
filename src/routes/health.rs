@@ -17,7 +17,7 @@ pub async fn favicon() -> impl IntoResponse {
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let start = std::time::Instant::now();
-    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
         .await
         .is_ok();

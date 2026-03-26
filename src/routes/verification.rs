@@ -75,12 +75,17 @@ pub fn render_verify_page(base_url: &str) -> String {
         .divider {{ border: none; border-top: 1px solid #1e293b; margin: 16px 0; }}
         .trust-note {{ font-size: 13px; color: #94a3b8; background: #111827; border-left: 3px solid #3b82f6; padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 10px 0; line-height: 1.6; }}
         .trust-note strong {{ color: #e2e8f0; }}
+        .btn-logout {{ background: transparent; color: #94a3b8; border: 1px solid #1e293b; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: inherit; transition: all .15s; }}
+        .btn-logout:hover {{ color: #f87171; border-color: #7f1d1d; background: #7f1d1d22; }}
     </style>
 </head>
 <body>
-    <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
-        <h1 style="margin:0;">YouTube Sub Role</h1>
-        <span style="font-size:11px; color:#64748b; background:#1e293b; padding:2px 8px; border-radius:4px;">Powered by <a href="https://rolelogic.faizo.net" target="_blank" rel="noopener" style="color:#74b9ff; text-decoration:none;">RoleLogic</a></span>
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:4px;">
+        <div style="display:flex; align-items:center; gap:10px;">
+            <h1 style="margin:0;">YouTube Sub Role</h1>
+            <span style="font-size:11px; color:#64748b; background:#1e293b; padding:2px 8px; border-radius:4px;">Powered by <a href="https://rolelogic.faizo.net" target="_blank" rel="noopener" style="color:#74b9ff; text-decoration:none;">RoleLogic</a></span>
+        </div>
+        <button id="logout-btn" class="btn-logout hidden" onclick="doLogout()">Logout</button>
     </div>
     <p class="subtitle">Link your Discord and YouTube accounts to automatically receive server roles based on your YouTube subscriptions.</p>
 
@@ -173,6 +178,7 @@ pub fn render_verify_page(base_url: &str) -> String {
     async function init() {{
         try {{
             const s = await api('GET', '/verify/status');
+            document.getElementById('logout-btn').classList.remove('hidden');
             if (s.linked) {{
                 document.getElementById('linked-discord').textContent = s.display_name;
                 document.getElementById('linked-youtube').textContent = 'Connected';
@@ -186,12 +192,23 @@ pub fn render_verify_page(base_url: &str) -> String {
         }}
     }}
 
+    async function doLogout() {{
+        clearMsg();
+        try {{
+            await api('POST', '/verify/logout');
+            document.getElementById('logout-btn').classList.add('hidden');
+            showSection('login-section');
+            showMsg('Logged out.', 'success');
+        }} catch (e) {{ showMsg(e.message, 'error'); }}
+    }}
+
     async function doUnlink() {{
         clearMsg();
         if (!confirm('Unlink your account? You will lose all assigned roles.')) return;
         try {{
             await api('POST', '/verify/unlink');
-            showSection('login-section');
+            document.getElementById('yt-discord-badge').textContent = document.getElementById('linked-discord').textContent;
+            showSection('youtube-section');
             showMsg('Account unlinked.', 'success');
         }} catch (e) {{ showMsg(e.message, 'error'); }}
     }}
@@ -457,6 +474,13 @@ pub async fn status(
         "display_name": display_name,
         "linked": account.is_some(),
     })))
+}
+
+pub async fn logout(jar: CookieJar) -> (CookieJar, Json<Value>) {
+    let cookie = Cookie::build(SESSION_COOKIE)
+        .path("/");
+    let jar = jar.remove(cookie);
+    (jar, Json(json!({"success": true})))
 }
 
 pub async fn unlink(

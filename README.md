@@ -2,10 +2,12 @@
 
 A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assigns Discord roles to members who are subscribed to a specific YouTube channel.
 
+> **Requires [Auth Gateway](../Auth-Gateway/)** — Discord login is handled by the centralized Auth Gateway. This plugin reads the shared `rl_session` cookie set by the gateway. Google OAuth for YouTube linking is handled directly by this plugin.
+
 ## How It Works
 
 1. **Admin** creates a role link in the RoleLogic dashboard and configures a YouTube Channel ID
-2. **Members** visit the verification page, sign in with Discord, then link their YouTube account via Google OAuth
+2. **Members** visit the verification page, sign in with Discord (via Auth Gateway), then link their YouTube account via Google OAuth
 3. **Plugin** periodically checks each member's subscription status using the YouTube Data API
 4. **Subscribed members** automatically receive the configured Discord role; unsubscribed members have it removed
 
@@ -23,7 +25,7 @@ A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assi
 - [Rust](https://rustup.rs/) 1.88+
 - PostgreSQL 16
 - Docker & Docker Compose (for deployment)
-- [Discord Application](https://discord.com/developers/applications) with OAuth2 (scopes: `identify`, `guilds`)
+- [Auth Gateway](../Auth-Gateway/) running on `your-domain.com/auth/*`
 - [Google Cloud Project](https://console.cloud.google.com/) with YouTube Data API v3 enabled and OAuth2 credentials
 
 ### Environment Variables
@@ -32,12 +34,10 @@ Copy `.env.example` to `.env` and fill in:
 
 ```env
 DATABASE_URL=postgres://ysr:password@db:5432/youtube_sub_role
-DISCORD_CLIENT_ID=your_discord_client_id
-DISCORD_CLIENT_SECRET=your_discord_client_secret
 GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
-SESSION_SECRET=random_secret_string
-BASE_URL=https://your-domain.com
+SESSION_SECRET=random_secret_string       # must match Auth Gateway
+BASE_URL=https://your-domain.com/youtube-subscriber-role
 LISTEN_ADDR=0.0.0.0:8080
 YOUTUBE_QUOTA_PER_DAY=10000
 ```
@@ -47,7 +47,7 @@ YOUTUBE_QUOTA_PER_DAY=10000
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Enable **YouTube Data API v3**
 3. Create **OAuth 2.0 Client ID** (Web application)
-4. Add authorized redirect URI: `https://your-domain.com/verify/youtube/callback`
+4. Add authorized redirect URI: `https://your-domain.com/youtube-subscriber-role/verify/youtube/callback`
 5. Copy Client ID and Client Secret to `.env`
 
 ### Run with Docker Compose
@@ -64,6 +64,8 @@ cargo run
 
 ## API Endpoints
 
+All routes are nested under `/youtube-subscriber-role`:
+
 ### RoleLogic Plugin (called by RoleLogic dashboard)
 
 | Method   | Path        | Purpose                        |
@@ -75,15 +77,14 @@ cargo run
 
 ### User Verification
 
-| Method | Path                       | Purpose                    |
-| ------ | -------------------------- | -------------------------- |
-| `GET`  | `/verify`                  | Verification page (HTML)   |
-| `GET`  | `/verify/login`            | Discord OAuth redirect     |
-| `GET`  | `/verify/callback`         | Discord OAuth callback     |
-| `GET`  | `/verify/youtube`          | Google OAuth redirect      |
-| `GET`  | `/verify/youtube/callback` | Google OAuth callback      |
-| `GET`  | `/verify/status`           | Current link status (JSON) |
-| `POST` | `/verify/unlink`           | Unlink account             |
+| Method | Path                       | Purpose                              |
+| ------ | -------------------------- | ------------------------------------ |
+| `GET`  | `/verify`                  | Verification page (HTML)             |
+| `GET`  | `/verify/login`            | Redirects to Auth Gateway for Discord login |
+| `GET`  | `/verify/youtube`          | Google OAuth redirect                |
+| `GET`  | `/verify/youtube/callback` | Google OAuth callback                |
+| `GET`  | `/verify/status`           | Current link status (JSON)           |
+| `POST` | `/verify/unlink`           | Unlink account                       |
 
 ### Health
 

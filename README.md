@@ -2,7 +2,7 @@
 
 A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assigns Discord roles to members who are subscribed to a specific YouTube channel.
 
-> **Requires [Auth Gateway](../Auth-Gateway/)** — Discord login is handled by the centralized Auth Gateway. This plugin reads the shared `rl_session` cookie set by the gateway. Google OAuth for YouTube linking is handled directly by this plugin.
+> **Requires [Auth Gateway](https://github.com/FaizoKen/Auth-Gateway)** — Discord login is handled by the centralized Auth Gateway. This plugin reads the shared `rl_session` cookie set by the gateway. Google OAuth for YouTube linking is handled directly by this plugin.
 
 ## How It Works
 
@@ -25,7 +25,7 @@ A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assi
 - [Rust](https://rustup.rs/) 1.88+
 - PostgreSQL 16
 - Docker & Docker Compose (for deployment)
-- [Auth Gateway](../Auth-Gateway/) running on `your-domain.com/auth/*`
+- [Auth Gateway](https://github.com/FaizoKen/Auth-Gateway) running on `your-domain.com/auth/*`
 - [Google Cloud Project](https://console.cloud.google.com/) with YouTube Data API v3 enabled and OAuth2 credentials
 
 ### Environment Variables
@@ -77,14 +77,14 @@ All routes are nested under `/youtube-subscriber-role`:
 
 ### User Verification
 
-| Method | Path                       | Purpose                              |
-| ------ | -------------------------- | ------------------------------------ |
-| `GET`  | `/verify`                  | Verification page (HTML)             |
+| Method | Path                       | Purpose                                     |
+| ------ | -------------------------- | ------------------------------------------- |
+| `GET`  | `/verify`                  | Verification page (HTML)                    |
 | `GET`  | `/verify/login`            | Redirects to Auth Gateway for Discord login |
-| `GET`  | `/verify/youtube`          | Google OAuth redirect                |
-| `GET`  | `/verify/youtube/callback` | Google OAuth callback                |
-| `GET`  | `/verify/status`           | Current link status (JSON)           |
-| `POST` | `/verify/unlink`           | Unlink account                       |
+| `GET`  | `/verify/youtube`          | Google OAuth redirect                       |
+| `GET`  | `/verify/youtube/callback` | Google OAuth callback                       |
+| `GET`  | `/verify/status`           | Current link status (JSON)                  |
+| `POST` | `/verify/unlink`           | Unlink account                              |
 
 ### Health
 

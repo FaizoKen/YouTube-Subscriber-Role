@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::AppError;
+use crate::models::condition::Condition;
 use crate::schema;
 use crate::services::sync::ConfigSyncEvent;
 use crate::AppState;
@@ -60,16 +61,26 @@ pub async fn get_config(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_token(&headers)?;
 
-    let link = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT channel_id FROM role_links WHERE api_token = $1",
+    let link = sqlx::query_as::<_, (Option<String>, Value)>(
+        "SELECT channel_id, conditions FROM role_links WHERE api_token = $1",
     )
     .bind(&token)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::Unauthorized)?;
 
+    let (channel_id, raw_conditions) = link;
+
+    // Deserialize conditions with tolerance for old format
+    let conditions: Vec<Condition> = raw_conditions
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|v| serde_json::from_value::<Condition>(v.clone()).ok())
+        .collect();
+
     let verify_url = format!("{}/verify", state.config.base_url);
-    let schema = schema::build_config_schema(link.0.as_deref(), &verify_url);
+    let schema = schema::build_config_schema(channel_id.as_deref(), &conditions, &verify_url);
 
     Ok(Json(schema))
 }
@@ -103,37 +114,53 @@ pub async fn post_config(
         return Err(AppError::Unauthorized);
     }
 
-    let channel_id = schema::parse_config(&body.config)?;
+    let (channel_id, conditions) = schema::parse_config(&body.config)?;
 
     sqlx::query(
         "UPDATE role_links SET channel_id = $1, conditions = $2, updated_at = now() \
          WHERE guild_id = $3 AND role_id = $4",
     )
     .bind(&channel_id)
-    .bind(serde_json::json!([{"channel_id": channel_id}]))
+    .bind(serde_json::json!(&conditions))
     .bind(&body.guild_id)
     .bind(&body.role_id)
     .execute(&state.pool)
     .await?;
 
-    // Seed subscription_cache rows for all linked users in this guild
-    // so the refresh worker picks them up for checking
+    // Seed subscription_cache rows for all linked accounts for this channel
+    // so the refresh worker picks them up. No guild filtering needed here —
+    // the sync engine handles guild scoping via Auth Gateway.
     sqlx::query(
         "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
          SELECT la.discord_id, $1, now() \
          FROM linked_accounts la \
-         JOIN user_guilds ug ON ug.discord_id = la.discord_id AND ug.guild_id = $2 \
          ON CONFLICT (discord_id, channel_id) DO NOTHING",
     )
     .bind(&channel_id)
-    .bind(&body.guild_id)
     .execute(&state.pool)
     .await?;
+
+    // If conditions need channel stats, seed channel_cache rows too
+    let needs_channel_cache = conditions
+        .iter()
+        .any(|c| c.field.needs_channel_cache());
+
+    if needs_channel_cache {
+        sqlx::query(
+            "INSERT INTO channel_cache (discord_id, next_check_at) \
+             SELECT la.discord_id, now() \
+             FROM linked_accounts la \
+             ON CONFLICT (discord_id) DO NOTHING",
+        )
+        .execute(&state.pool)
+        .await?;
+    }
 
     tracing::info!(
         guild_id = body.guild_id,
         role_id = body.role_id,
         channel_id,
+        condition_count = conditions.len(),
         "Config updated"
     );
 

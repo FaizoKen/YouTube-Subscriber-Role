@@ -19,6 +19,23 @@ pub struct GoogleTokens {
     pub expires_in: i64,
 }
 
+/// Result of a subscription check, including when the subscription was created.
+pub struct SubscriptionResult {
+    pub is_subscribed: bool,
+    pub subscribed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Statistics about the user's own YouTube channel.
+pub struct ChannelStats {
+    pub subscriber_count: i64,
+    pub view_count: i64,
+    pub video_count: i64,
+    pub channel_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub hidden_subscriber_count: bool,
+    pub country: Option<String>,
+    pub custom_url: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct GoogleTokenResponse {
     access_token: String,
@@ -28,7 +45,46 @@ struct GoogleTokenResponse {
 
 #[derive(serde::Deserialize)]
 struct SubscriptionListResponse {
-    items: Option<Vec<serde_json::Value>>,
+    items: Option<Vec<SubscriptionItem>>,
+}
+
+#[derive(serde::Deserialize)]
+struct SubscriptionItem {
+    snippet: Option<SubscriptionSnippet>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscriptionSnippet {
+    published_at: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelListResponse {
+    items: Option<Vec<ChannelItem>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelItem {
+    snippet: Option<ChannelSnippet>,
+    statistics: Option<ChannelStatistics>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelSnippet {
+    published_at: Option<String>,
+    country: Option<String>,
+    custom_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelStatistics {
+    subscriber_count: Option<String>,
+    view_count: Option<String>,
+    video_count: Option<String>,
+    hidden_subscriber_count: Option<bool>,
 }
 
 impl YouTubeClient {
@@ -51,12 +107,12 @@ impl YouTubeClient {
     }
 
     /// Check if a user is subscribed to a specific YouTube channel.
-    /// Returns true if subscribed, false otherwise.
+    /// Returns subscription status and the date the subscription was created.
     pub async fn check_subscription(
         &self,
         access_token: &str,
         channel_id: &str,
-    ) -> Result<bool, YouTubeError> {
+    ) -> Result<SubscriptionResult, YouTubeError> {
         let resp = self
             .http
             .get("https://www.googleapis.com/youtube/v3/subscriptions")
@@ -101,7 +157,118 @@ impl YouTubeClient {
             .await
             .map_err(|e| YouTubeError::ApiError(format!("Failed to parse response: {e}")))?;
 
-        Ok(body.items.map_or(false, |items| !items.is_empty()))
+        match body.items {
+            Some(items) if !items.is_empty() => {
+                let subscribed_at = items[0]
+                    .snippet
+                    .as_ref()
+                    .and_then(|s| s.published_at.as_deref())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+
+                Ok(SubscriptionResult {
+                    is_subscribed: true,
+                    subscribed_at,
+                })
+            }
+            _ => Ok(SubscriptionResult {
+                is_subscribed: false,
+                subscribed_at: None,
+            }),
+        }
+    }
+
+    /// Fetch the user's own YouTube channel statistics.
+    /// Returns None-like stats if the user has no YouTube channel.
+    pub async fn fetch_channel_stats(
+        &self,
+        access_token: &str,
+    ) -> Result<ChannelStats, YouTubeError> {
+        let resp = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/channels")
+            .query(&[
+                ("part", "statistics,snippet"),
+                ("mine", "true"),
+            ])
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .await?;
+
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(YouTubeError::TokenExpired);
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("quotaExceeded") {
+                return Err(YouTubeError::QuotaExceeded);
+            }
+            if body.contains("forbidden") || body.contains("insufficientPermissions") {
+                return Err(YouTubeError::TokenRevoked);
+            }
+            return Err(YouTubeError::ApiError(format!("403: {body}")));
+        }
+
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(YouTubeError::ApiError(format!("{status}: {body}")));
+        }
+
+        let body: ChannelListResponse = resp
+            .json()
+            .await
+            .map_err(|e| YouTubeError::ApiError(format!("Failed to parse response: {e}")))?;
+
+        let item = body.items.and_then(|mut items| {
+            if items.is_empty() {
+                None
+            } else {
+                Some(items.remove(0))
+            }
+        });
+
+        let Some(item) = item else {
+            // User has a Google account but no YouTube channel
+            return Ok(ChannelStats {
+                subscriber_count: 0,
+                view_count: 0,
+                video_count: 0,
+                channel_created_at: None,
+                hidden_subscriber_count: false,
+                country: None,
+                custom_url: None,
+            });
+        };
+
+        let stats = item.statistics.as_ref();
+        let snippet = item.snippet.as_ref();
+
+        Ok(ChannelStats {
+            subscriber_count: stats
+                .and_then(|s| s.subscriber_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            view_count: stats
+                .and_then(|s| s.view_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            video_count: stats
+                .and_then(|s| s.video_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            channel_created_at: snippet
+                .and_then(|s| s.published_at.as_deref())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            hidden_subscriber_count: stats
+                .and_then(|s| s.hidden_subscriber_count)
+                .unwrap_or(false),
+            country: snippet.and_then(|s| s.country.clone()),
+            custom_url: snippet.and_then(|s| s.custom_url.clone()),
+        })
     }
 
     /// Exchange a Google OAuth authorization code for tokens.

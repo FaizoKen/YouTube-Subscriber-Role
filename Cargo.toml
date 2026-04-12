@@ -2,6 +2,7 @@
 name = "youtube-sub-role"
 version = "0.1.0"
 edition = "2021"
+default-run = "youtube-sub-role"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }

@@ -13,11 +13,11 @@ pub async fn run(mut rx: mpsc::Receiver<PlayerSyncEvent>, state: Arc<AppState>) 
             PlayerSyncEvent::PlayerUpdated { discord_id }
             | PlayerSyncEvent::AccountLinked { discord_id } => {
                 tracing::debug!(discord_id, event = ?event, "Syncing roles for player");
-                sync::sync_for_player(discord_id, &state.pool, &state.rl_client).await
+                sync::sync_for_player(discord_id, &state).await
             }
             PlayerSyncEvent::AccountUnlinked { discord_id } => {
                 tracing::debug!(discord_id, "Removing all assignments for unlinked user");
-                sync::remove_all_assignments(discord_id, &state.pool, &state.rl_client).await
+                sync::remove_all_assignments(discord_id, &state).await
             }
         };
 

@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
 use futures_util::stream::{self, StreamExt};
-use sqlx::PgPool;
 
 use crate::error::AppError;
-use crate::services::rolelogic::RoleLogicClient;
+use crate::services::auth_gateway;
+use crate::AppState;
 
 /// Events sent to the player sync worker (lightweight, per-user).
 #[derive(Debug, Clone)]
@@ -25,17 +25,31 @@ pub struct ConfigSyncEvent {
 /// Checks subscription_cache for each role link's channel_id, then adds/removes roles.
 pub async fn sync_for_player(
     discord_id: &str,
-    pool: &PgPool,
-    rl_client: &RoleLogicClient,
+    state: &AppState,
 ) -> Result<(), AppError> {
+    let pool = &state.pool;
+    let rl_client = &state.rl_client;
+
+    // Get guild IDs from Auth Gateway
+    let guild_ids = auth_gateway::fetch_user_guild_ids(
+        &state.http,
+        &state.config.auth_gateway_url,
+        &state.config.internal_api_key,
+        discord_id,
+    )
+    .await?;
+
+    if guild_ids.is_empty() {
+        return Ok(());
+    }
+
     // Get role links for guilds this user is a member of (only those with a configured channel)
     let role_links = sqlx::query_as::<_, (String, String, String, String)>(
         "SELECT rl.guild_id, rl.role_id, rl.api_token, rl.channel_id \
          FROM role_links rl \
-         JOIN user_guilds ug ON ug.guild_id = rl.guild_id \
-         WHERE ug.discord_id = $1 AND rl.channel_id IS NOT NULL",
+         WHERE rl.guild_id = ANY($1) AND rl.channel_id IS NOT NULL",
     )
-    .bind(discord_id)
+    .bind(&guild_ids[..])
     .fetch_all(pool)
     .await?;
 
@@ -161,9 +175,11 @@ pub async fn sync_for_player(
 pub async fn sync_for_role_link(
     guild_id: &str,
     role_id: &str,
-    pool: &PgPool,
-    rl_client: &RoleLogicClient,
+    state: &AppState,
 ) -> Result<(), AppError> {
+    let pool = &state.pool;
+    let rl_client = &state.rl_client;
+
     let link = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT api_token, channel_id FROM role_links WHERE guild_id = $1 AND role_id = $2",
     )
@@ -176,6 +192,24 @@ pub async fn sync_for_role_link(
         return Ok(());
     };
 
+    let member_ids = auth_gateway::fetch_guild_member_ids(
+        &state.http,
+        &state.config.auth_gateway_url,
+        &state.config.internal_api_key,
+        guild_id,
+    )
+    .await?;
+
+    if member_ids.is_empty() {
+        rl_client.replace_users(guild_id, role_id, &[], &api_token).await?;
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM role_assignments WHERE guild_id = $1 AND role_id = $2")
+            .bind(guild_id).bind(role_id)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
     // Query the user limit from RoleLogic
     let (_user_count, user_limit) = rl_client
         .get_user_info(guild_id, role_id, &api_token)
@@ -187,13 +221,13 @@ pub async fn sync_for_role_link(
         "SELECT la.discord_id \
          FROM linked_accounts la \
          JOIN subscription_cache sc ON sc.discord_id = la.discord_id AND sc.channel_id = $1 \
-         JOIN user_guilds ug ON ug.discord_id = la.discord_id AND ug.guild_id = $2 \
-         WHERE sc.is_subscribed = TRUE \
+         WHERE la.discord_id = ANY($2::text[]) \
+           AND sc.is_subscribed = TRUE \
          ORDER BY la.linked_at ASC \
          LIMIT $3",
     )
     .bind(&channel_id)
-    .bind(guild_id)
+    .bind(&member_ids[..])
     .bind(user_limit as i64)
     .fetch_all(pool)
     .await?;
@@ -230,9 +264,11 @@ pub async fn sync_for_role_link(
 /// Remove a user from all role assignments (after account unlink).
 pub async fn remove_all_assignments(
     discord_id: &str,
-    pool: &PgPool,
-    rl_client: &RoleLogicClient,
+    state: &AppState,
 ) -> Result<(), AppError> {
+    let pool = &state.pool;
+    let rl_client = &state.rl_client;
+
     let assignments = sqlx::query_as::<_, (String, String, String)>(
         "SELECT ra.guild_id, ra.role_id, rl.api_token \
          FROM role_assignments ra \

@@ -29,6 +29,7 @@ pub struct AppState {
     pub rl_client: RoleLogicClient,
     pub http: reqwest::Client,
     pub verify_html: bytes::Bytes,
+    pub subscribers_html: bytes::Bytes,
 }
 
 #[tokio::main]
@@ -59,6 +60,7 @@ async fn main() {
         .build()
         .expect("Failed to build OAuth HTTP client");
     let verify_html = bytes::Bytes::from(routes::verification::render_verify_page(&app_config.base_url));
+    let subscribers_html = bytes::Bytes::from(routes::subscribers::render_subscribers_page(&app_config.base_url));
 
     let state = Arc::new(AppState {
         pool,
@@ -69,6 +71,7 @@ async fn main() {
         rl_client,
         http,
         verify_html,
+        subscribers_html,
     });
 
     // Spawn background workers
@@ -84,6 +87,9 @@ async fn main() {
             .route("/config", get(routes::plugin::get_config))
             .route("/config", post(routes::plugin::post_config))
             .route("/config", delete(routes::plugin::delete_config))
+            // Subscribers list (user-facing, auth via cookie)
+            .route("/subscribers/{guild_id}", get(routes::subscribers::subscribers_page))
+            .route("/subscribers/{guild_id}/data", get(routes::subscribers::subscribers_data))
             // Verification endpoints (user-facing)
             .route("/verify", get(routes::verification::verify_page))
             .route("/verify/login", get(routes::verification::login))

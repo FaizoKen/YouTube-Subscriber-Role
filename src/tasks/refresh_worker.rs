@@ -212,19 +212,31 @@ pub async fn run(state: Arc<AppState>) {
                     continue;
                 }
 
-                // Fetch channel stats if any conditions need them
-                if cached_interval.needs_channel_stats() {
-                    // Check if channel_cache needs refresh for this user
+                // Fetch channel stats if any conditions need them OR the user has
+                // a channel_cache row (seeded at account-link time for the
+                // subscribers list page).
+                {
                     let needs_refresh = sqlx::query_scalar::<_, bool>(
                         "SELECT COALESCE( \
                             (SELECT cc.next_check_at <= now() FROM channel_cache cc WHERE cc.discord_id = $1), \
-                            TRUE \
+                            FALSE \
                          )",
                     )
                     .bind(&discord_id)
                     .fetch_one(&state.pool)
                     .await
-                    .unwrap_or(true);
+                    .unwrap_or(false);
+
+                    // Also refresh if conditions require channel stats and no row exists yet
+                    let needs_refresh = needs_refresh
+                        || (cached_interval.needs_channel_stats()
+                            && sqlx::query_scalar::<_, bool>(
+                                "SELECT NOT EXISTS(SELECT 1 FROM channel_cache WHERE discord_id = $1)",
+                            )
+                            .bind(&discord_id)
+                            .fetch_one(&state.pool)
+                            .await
+                            .unwrap_or(false));
 
                     if needs_refresh {
                         // Wait for another rate limiter permit (this is a second API call)

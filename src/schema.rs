@@ -9,6 +9,8 @@ pub fn build_config_schema(
     channel_id: Option<&str>,
     conditions: &[Condition],
     verify_url: &str,
+    subscribers_url: &str,
+    view_permission: &str,
 ) -> Value {
     // Extract current condition values for populating the form
     let (field_val, op_val) = conditions.first().map_or(("", "gte"), |c| {
@@ -31,36 +33,25 @@ pub fn build_config_schema(
         }
     }
 
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "version": 1,
         "name": "YouTube Subscriber Role",
         "description": "Assign a Discord role to members subscribed to a YouTube channel.",
         "sections": [
             {
-                "title": "Getting Started",
+                "title": "Setup",
                 "fields": [
                     {
                         "type": "display",
                         "key": "info",
                         "label": "How it works",
-                        "value": format!(
-                            "This plugin assigns a role to members who are subscribed to a specific YouTube channel.\n\n\
-                             **Step 1:** Members link their accounts at:\n{verify_url}\n\n\
-                             **Step 2:** You configure the YouTube channel and optional conditions below.\n\n\
-                             **Step 3:** Members who meet the criteria automatically receive this role."
-                        )
-                    }
-                ]
-            },
-            {
-                "title": "YouTube Channel",
-                "description": "The YouTube channel members must be subscribed to.",
-                "fields": [
+                        "value": "1. Enter your YouTube channel ID below\n2. Share the verification link with your members\n3. Members sign in with Discord & YouTube  — the role is assigned automatically"
+                    },
                     {
                         "type": "text",
                         "key": "channel_id",
                         "label": "YouTube Channel ID",
-                        "description": "The channel ID (e.g. UCxxxxxx). Copy it from: https://www.youtube.com/account_advanced",
+                        "description": "Find it at https://www.youtube.com/account_advanced (starts with UC, 24 characters).",
                         "placeholder": "UCxxxxxxxxxxxxxxxxxxxxxxxx",
                         "validation": {
                             "required": true,
@@ -72,9 +63,7 @@ pub fn build_config_schema(
             },
             {
                 "title": "Additional Condition",
-                "description": "Optionally require an additional condition beyond being subscribed to the channel.",
-                "collapsible": true,
-                "default_collapsed": conditions.is_empty(),
+                "description": "Optionally require more than just being subscribed (e.g. minimum sub count, subscription age).",
                 "fields": [
                     {
                         "type": "select",
@@ -241,10 +230,72 @@ pub fn build_config_schema(
                         "condition": { "field": "field", "equals": "hasCustomUrl" }
                     }
                 ]
+            },
+            {
+                "title": "Subscriber List Access",
+                "description": "Who can view the subscriber list page. This applies to the entire server.",
+                "fields": [
+                    {
+                        "type": "radio",
+                        "key": "view_permission",
+                        "label": "Who can view",
+                        "description": "Shared across all role links in this server.",
+                        "default_value": "members",
+                        "options": [
+                            { "label": "All server members", "value": "members" },
+                            { "label": "Server managers only (Manage Server permission)", "value": "managers" }
+                        ]
+                    }
+                ]
+            },
+            {
+                "title": "Share with your members",
+                "description": "Copy these links and share them in your server.",
+                "collapsible": true,
+                "default_collapsed": false,
+                "fields": [
+                    {
+                        "type": "url",
+                        "key": "verify_url",
+                        "label": "Verification Link",
+                        "description": "Members click this to connect their YouTube account. Post it in your announcements or rules channel.",
+                        "validation": { "readonly": true }
+                    },
+                    {
+                        "type": "url",
+                        "key": "subscribers_url",
+                        "label": "Subscriber List",
+                        "description": "Shows all verified subscribers in your server.",
+                        "validation": { "readonly": true }
+                    },
+                    {
+                        "type": "display",
+                        "key": "announcement_template",
+                        "label": "Announcement Template — copy and paste into your Discord server",
+                        "value": format!(
+                            "**Get your YouTube Subscriber role!**\n\n\
+                            We've set up automatic role assignment for YouTube subscribers:\n\n\
+                            1. Click the link below and sign in with Discord\n\
+                            2. Connect your YouTube account (one-time setup)\n\
+                            3. Done! Your role will be assigned automatically\n\n\
+                            **Verify here:** {verify_url}\n\n\
+                            **See who's verified:** {subscribers_url}"
+                        )
+                    }
+                ]
             }
         ],
         "values": values
-    })
+    });
+
+    // Inject extra values after the json! macro (can't use format! inside json!)
+    if let Some(vals) = schema.get_mut("values") {
+        vals["view_permission"] = serde_json::json!(view_permission);
+        vals["verify_url"] = serde_json::json!(verify_url);
+        vals["subscribers_url"] = serde_json::json!(subscribers_url);
+    }
+
+    schema
 }
 
 /// Parse and validate config from POST /config.

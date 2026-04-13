@@ -327,14 +327,38 @@ pub async fn youtube_callback(
     .execute(&state.pool)
     .await?;
 
-    // Seed subscription_cache for all channels configured in guilds this user is in
+    // Seed subscription_cache for all channels configured in guilds this user is in.
+    // Guild membership lives in the Auth Gateway — query it over HTTP, then filter
+    // role_links locally.
+    let guild_ids = crate::services::auth_gateway::fetch_user_guild_ids(
+        &state.http,
+        &state.config.auth_gateway_url,
+        &state.config.internal_api_key,
+        &discord_id,
+    )
+    .await
+    .unwrap_or_default();
+
+    if !guild_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
+             SELECT $1, rl.channel_id, now() \
+             FROM role_links rl \
+             WHERE rl.guild_id = ANY($2) AND rl.channel_id IS NOT NULL \
+             ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",
+        )
+        .bind(&discord_id)
+        .bind(&guild_ids)
+        .execute(&state.pool)
+        .await?;
+    }
+
+    // Seed channel_cache so the refresh worker fetches this user's YouTube channel
+    // stats (subscriber count, views, etc.) for the subscribers list page.
     sqlx::query(
-        "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
-         SELECT $1, rl.channel_id, now() \
-         FROM role_links rl \
-         JOIN user_guilds ug ON ug.guild_id = rl.guild_id \
-         WHERE ug.discord_id = $1 AND rl.channel_id IS NOT NULL \
-         ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",
+        "INSERT INTO channel_cache (discord_id, next_check_at) \
+         VALUES ($1, now()) \
+         ON CONFLICT (discord_id) DO NOTHING",
     )
     .bind(&discord_id)
     .execute(&state.pool)

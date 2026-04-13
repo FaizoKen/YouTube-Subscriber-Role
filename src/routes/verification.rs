@@ -342,7 +342,7 @@ pub async fn youtube_callback(
     if !guild_ids.is_empty() {
         sqlx::query(
             "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
-             SELECT $1, rl.channel_id, now() \
+             SELECT DISTINCT $1, rl.channel_id, now() \
              FROM role_links rl \
              WHERE rl.guild_id = ANY($2) AND rl.channel_id IS NOT NULL \
              ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",

@@ -95,7 +95,7 @@ pub async fn get_config(
     .await?
     .unwrap_or_else(|| "members".to_string());
 
-    let verify_url = format!("{}/verify", state.config.base_url);
+    let verify_url = format!("{}/verify?guild={}", state.config.base_url, guild_id);
     let subscribers_url = format!("{}/subscribers/{}", state.config.base_url, guild_id);
     let schema = schema::build_config_schema(
         channel_id.as_deref(),

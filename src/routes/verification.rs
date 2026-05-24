@@ -77,6 +77,11 @@ pub fn render_verify_page(base_url: &str) -> String {
         .trust-note strong {{ color: #e2e8f0; }}
         .btn-logout {{ background: transparent; color: #94a3b8; border: 1px solid #1e293b; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: inherit; transition: all .15s; }}
         .btn-logout:hover {{ color: #f87171; border-color: #7f1d1d; background: #7f1d1d22; }}
+        .guild-ctx {{ display: none; align-items: center; gap: 10px; background: #052e16; border: 1px solid #14532d; color: #86efac; padding: 8px 14px; border-radius: 8px; margin: 12px 0 6px; font-size: 13px; line-height: 1.5; }}
+        .guild-ctx.show {{ display: flex; }}
+        .guild-ctx.warn {{ background: #1c1208; border-color: #422006; color: #fbbf24; }}
+        .guild-ctx .gctx-icon {{ flex-shrink: 0; }}
+        .guild-ctx .gctx-name {{ color: #fff; font-weight: 600; }}
     </style>
 </head>
 <body>
@@ -88,6 +93,14 @@ pub fn render_verify_page(base_url: &str) -> String {
         <button id="logout-btn" class="btn-logout hidden" onclick="doLogout()">Logout</button>
     </div>
     <p class="subtitle">Link your Discord and YouTube accounts to automatically receive server roles based on your YouTube subscriptions.</p>
+
+    <!-- Server context banner: only shown when ?guild=<id> is present in the URL.
+         Lets a server admin share a per-guild link that both verifies the user
+         AND auto-enables the role for that specific server in one shot. -->
+    <div id="guild-ctx" class="guild-ctx">
+        <svg class="gctx-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        <span id="guild-ctx-text"></span>
+    </div>
 
     <!-- Loading -->
     <div id="loading-section" class="card">
@@ -132,6 +145,10 @@ pub fn render_verify_page(base_url: &str) -> String {
         <div class="info-row"><span class="label">Discord</span> <span class="val" id="linked-discord" style="color:#94a3b8;font-weight:400;font-size:13px;"></span></div>
         <div class="info-row"><span class="label">YouTube</span> <span class="val" id="linked-youtube" style="color:#ff4444;font-size:13px;"></span></div>
         <p style="color:#4ade80; margin-top:12px; font-size:13px;">Your roles are assigned automatically based on your YouTube subscriptions.</p>
+        <p style="margin-top:14px; font-size:13px; color:#94a3b8;">
+            Receiving YouTube roles in servers you didn't intend?
+            <a href="/auth/my_servers?from=/youtube-subscriber-role/verify" style="color:#74b9ff;">Choose which servers receive roles →</a>
+        </p>
         <hr class="divider">
         <div class="actions">
             <button class="btn btn-danger" onclick="doUnlink()">Unlink Account</button>
@@ -145,6 +162,31 @@ pub fn render_verify_page(base_url: &str) -> String {
 
     <script>
     const API = '{base_url}';
+    const PLUGIN_SLUG = 'youtube-subscriber-role';
+
+    // Optional ?guild=<id> tells us the user came from a per-guild verify
+    // link an admin shared in their Discord. We use it to (a) show a
+    // contextual banner so the user knows which server this is for and
+    // (b) automatically clear any existing opt-out (both per-plugin and
+    // the guild-wide master) once they're authenticated — so a returning
+    // user who'd previously disabled this server doesn't have to find
+    // /auth/my_servers to re-enable it.
+    const guildId = (() => {{
+        try {{
+            const v = new URLSearchParams(window.location.search).get('guild');
+            return v && /^[0-9]{{5,25}}$/.test(v) ? v : '';
+        }} catch (e) {{ return ''; }}
+    }})();
+
+    // Preserve the guild context across the Discord OAuth round-trip so
+    // an unauth visitor who logs in lands back on this same per-guild URL.
+    (function patchLoginHref() {{
+        if (!guildId) return;
+        const link = document.querySelector('#login-section a.btn-discord');
+        if (!link) return;
+        const returnTo = '/youtube-subscriber-role/verify?guild=' + encodeURIComponent(guildId);
+        link.href = '/auth/login?return_to=' + encodeURIComponent(returnTo);
+    }})();
 
     async function api(method, path, body) {{
         const opts = {{ method, headers: {{}}, credentials: 'include' }};
@@ -154,6 +196,21 @@ pub fn render_verify_page(base_url: &str) -> String {
         }}
         const res = await fetch(API + path, opts);
         const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        return data;
+    }}
+
+    // Gateway-absolute API helper for /auth/* (cookie-authed via the
+    // shared rl_session). Same shape as `api()` but doesn't prefix with
+    // the plugin's base_url.
+    async function gatewayApi(method, path, body) {{
+        const opts = {{ method, headers: {{}}, credentials: 'include' }};
+        if (body) {{
+            opts.headers['Content-Type'] = 'application/json';
+            opts.body = JSON.stringify(body);
+        }}
+        const res = await fetch(path, opts);
+        const data = await res.json().catch(() => ({{}}));
         if (!res.ok) throw new Error(data.error || 'Request failed');
         return data;
     }}
@@ -175,9 +232,73 @@ pub fn render_verify_page(base_url: &str) -> String {
 
     function clearMsg() {{ document.getElementById('msg').classList.add('hidden'); }}
 
+    function showGuildCtx(text, isWarning) {{
+        const el = document.getElementById('guild-ctx');
+        document.getElementById('guild-ctx-text').innerHTML = text;
+        el.classList.toggle('warn', !!isWarning);
+        el.classList.add('show');
+    }}
+
+    let isLinked = false;
+
+    // Resolve guildId → display name via the gateway, then clear any
+    // opt-out blocking this plugin from assigning roles in that server.
+    // Idempotent: clearing rows that don't exist is a no-op on the server.
+    async function applyGuildContext() {{
+        if (!guildId) return;
+        let prefs;
+        try {{
+            prefs = await gatewayApi('GET', '/auth/preferences');
+        }} catch (e) {{
+            // Not a fatal failure for the verify flow — just skip the banner.
+            return;
+        }}
+        const g = (prefs.guilds || []).find(x => x.guild_id === guildId);
+        if (!g) {{
+            // Either the user isn't in that guild, or the gateway hasn't
+            // refreshed their guild list yet. Surface it gently — verify
+            // still works; the role just won't apply until they're a member.
+            showGuildCtx("You're not in that server yet — join it on Discord, then refresh.", true);
+            return;
+        }}
+        const safeName = (g.guild_name || '(unnamed server)')
+            .replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
+        const wasDisabled = g.master_optout || (g.plugin_optouts || []).includes(PLUGIN_SLUG);
+        // Always clear both — the master toggle wins over per-plugin
+        // overrides, so we need to remove it too even if only the
+        // per-plugin row was set on this server.
+        try {{
+            if (g.master_optout) {{
+                await gatewayApi('POST', '/auth/preferences', {{
+                    guild_id: guildId, plugin: null, enabled: true,
+                }});
+            }}
+            if ((g.plugin_optouts || []).includes(PLUGIN_SLUG)) {{
+                await gatewayApi('POST', '/auth/preferences', {{
+                    guild_id: guildId, plugin: PLUGIN_SLUG, enabled: true,
+                }});
+            }}
+        }} catch (e) {{
+            // Even if the clear failed, still show the banner so the user
+            // knows where they are. The role will simply not apply until
+            // they fix it manually via /auth/my_servers.
+        }}
+        const nameHtml = '<span class="gctx-name">' + safeName + '</span>';
+        if (wasDisabled) {{
+            showGuildCtx(isLinked
+                ? 'Enabled YouTube roles for ' + nameHtml + ' — roles apply on the next sync.'
+                : 'Enabled YouTube roles for ' + nameHtml + ' — finish linking below to receive roles.');
+        }} else {{
+            showGuildCtx(isLinked
+                ? 'YouTube roles are active in ' + nameHtml + '.'
+                : 'Once linked, YouTube roles will apply in ' + nameHtml + '.');
+        }}
+    }}
+
     async function init() {{
         try {{
             const s = await api('GET', '/verify/status');
+            isLinked = !!s.linked;
             document.getElementById('logout-btn').classList.remove('hidden');
             if (s.linked) {{
                 document.getElementById('linked-discord').textContent = s.display_name;
@@ -187,6 +308,8 @@ pub fn render_verify_page(base_url: &str) -> String {
                 document.getElementById('yt-discord-badge').textContent = s.display_name;
                 showSection('youtube-section');
             }}
+            // Session is valid — apply the per-guild side effects (if any).
+            applyGuildContext();
         }} catch (e) {{
             showSection('login-section');
         }}

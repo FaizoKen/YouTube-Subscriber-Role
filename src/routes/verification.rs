@@ -60,6 +60,9 @@ pub fn render_verify_page(base_url: &str) -> String {
         .btn-google:hover {{ background: #c5221f; }}
         .btn-danger {{ background: transparent; color: #f87171; border: 1px solid #7f1d1d; font-size: 13px; padding: 8px 16px; }}
         .btn-danger:hover {{ background: #7f1d1d33; }}
+        .btn-recheck {{ background: transparent; color: #74b9ff; border: 1px solid #1e3a5f; font-size: 13px; padding: 8px 16px; }}
+        .btn-recheck:hover {{ background: #1e3a5f33; }}
+        .refresh-note {{ font-size: 13px; color: #94a3b8; margin-top: 12px; min-height: 18px; transition: color .15s; }}
         .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
         .badge {{ display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }}
         .badge-ok {{ background: #052e16; color: #4ade80; border: 1px solid #14532d; }}
@@ -145,12 +148,14 @@ pub fn render_verify_page(base_url: &str) -> String {
         <div class="info-row"><span class="label">Discord</span> <span class="val" id="linked-discord" style="color:#94a3b8;font-weight:400;font-size:13px;"></span></div>
         <div class="info-row"><span class="label">YouTube</span> <span class="val" id="linked-youtube" style="color:#ff4444;font-size:13px;"></span></div>
         <p style="color:#4ade80; margin-top:12px; font-size:13px;">Your roles are assigned automatically based on your YouTube subscriptions.</p>
+        <p id="refresh-note" class="refresh-note"></p>
         <p style="margin-top:14px; font-size:13px; color:#94a3b8;">
             Receiving YouTube roles in servers you didn't intend?
             <a href="/auth/my_servers?from=/youtube-subscriber-role/verify" style="color:#74b9ff;">Choose which servers receive roles →</a>
         </p>
         <hr class="divider">
         <div class="actions">
+            <button class="btn btn-recheck" onclick="doRefresh(false)">Re-check now</button>
             <button class="btn btn-danger" onclick="doUnlink()">Unlink Account</button>
         </div>
     </div>
@@ -304,6 +309,9 @@ pub fn render_verify_page(base_url: &str) -> String {
                 document.getElementById('linked-discord').textContent = s.display_name;
                 document.getElementById('linked-youtube').textContent = 'Connected';
                 showSection('linked-section');
+                // Visiting the page re-checks your latest subscription data so
+                // roles self-correct without an unlink/re-link. Best-effort.
+                doRefresh(true);
             }} else {{
                 document.getElementById('yt-discord-badge').textContent = s.display_name;
                 showSection('youtube-section');
@@ -323,6 +331,35 @@ pub fn render_verify_page(base_url: &str) -> String {
             showSection('login-section');
             showMsg('Logged out.', 'success');
         }} catch (e) {{ showMsg(e.message, 'error'); }}
+    }}
+
+    // Nudge the server to re-fetch this user's YouTube data ahead of schedule.
+    // `silent` is used for the automatic call on page load — it shows the
+    // working/result note but stays quiet on transient errors. The explicit
+    // "Re-check now" button passes false so failures surface.
+    let refreshing = false;
+    async function doRefresh(silent) {{
+        const note = document.getElementById('refresh-note');
+        if (refreshing) return;
+        refreshing = true;
+        note.style.color = '#94a3b8';
+        note.textContent = 'Checking your latest subscription status…';
+        try {{
+            const r = await api('POST', '/verify/refresh');
+            note.style.color = '#4ade80';
+            note.textContent = r.refreshed
+                ? '✓ Re-checking now — your roles update within a minute.'
+                : '✓ Your status is already up to date.';
+        }} catch (e) {{
+            if (silent) {{
+                note.textContent = '';
+            }} else {{
+                note.style.color = '#f87171';
+                note.textContent = 'Could not refresh right now — try again shortly.';
+            }}
+        }} finally {{
+            refreshing = false;
+        }}
     }}
 
     async function doUnlink() {{
@@ -525,6 +562,49 @@ pub async fn logout(jar: CookieJar) -> (CookieJar, Json<Value>) {
         .path("/");
     let jar = jar.remove(cookie);
     (jar, Json(json!({"success": true})))
+}
+
+/// Per-user floor between member-triggered re-checks. The refresh worker
+/// already rate-limits API calls; this just stops a page reload loop from
+/// re-forcing a check the worker only just completed and burning quota.
+const REFRESH_COOLDOWN_SECS: f64 = 60.0;
+
+/// Member-triggered "re-check my data now". When a linked user opens the
+/// verify page the page calls this so their YouTube subscription + channel
+/// stats get re-fetched ahead of schedule and their roles are corrected —
+/// no unlink/re-link needed. We don't fetch inline (that would bypass the
+/// rate limiter); we just bring the worker's `next_check_at` forward for
+/// rows that aren't already fresh, and the worker re-syncs roles after it
+/// re-checks. Idempotent: forcing a row that's already due is a no-op.
+pub async fn refresh(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+) -> Result<Json<Value>, AppError> {
+    let (discord_id, _) = get_session(&jar, &state.config.session_secret)?;
+
+    let subs = sqlx::query(
+        "UPDATE subscription_cache SET next_check_at = now() \
+         WHERE discord_id = $1 \
+           AND (checked_at IS NULL OR checked_at < now() - make_interval(secs => $2))",
+    )
+    .bind(&discord_id)
+    .bind(REFRESH_COOLDOWN_SECS)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    let chan = sqlx::query(
+        "UPDATE channel_cache SET next_check_at = now() \
+         WHERE discord_id = $1 \
+           AND (checked_at IS NULL OR checked_at < now() - make_interval(secs => $2))",
+    )
+    .bind(&discord_id)
+    .bind(REFRESH_COOLDOWN_SECS)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    Ok(Json(json!({ "refreshed": subs + chan > 0 })))
 }
 
 pub async fn unlink(

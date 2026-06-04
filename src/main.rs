@@ -96,6 +96,7 @@ async fn main() {
             .route("/verify/youtube", get(routes::verification::youtube_login))
             .route("/verify/youtube/callback", get(routes::verification::youtube_callback))
             .route("/verify/status", get(routes::verification::status))
+            .route("/verify/refresh", post(routes::verification::refresh))
             .route("/verify/unlink", post(routes::verification::unlink))
             .route("/verify/logout", post(routes::verification::logout))
             // Health & static

@@ -95,8 +95,12 @@ impl YouTubeClient {
             .build()
             .expect("Failed to build HTTP client");
 
-        // 2 requests per second to stay well within YouTube limits
-        let quota = Quota::per_second(NonZeroU32::new(2).unwrap());
+        // Short-term burst cap. The real ceiling is the daily quota (spread via
+        // per-row next_check_at scheduling); this just keeps us polite to the API
+        // while letting a verify spike — where many users link at once and each
+        // triggers an inline subscription check — drain in seconds instead of
+        // serializing at a couple per second.
+        let quota = Quota::per_second(NonZeroU32::new(10).unwrap());
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
         Self { http, rate_limiter }

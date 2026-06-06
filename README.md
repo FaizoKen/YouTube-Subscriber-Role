@@ -8,8 +8,9 @@ A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assi
 
 1. **Admin** creates a role link in the RoleLogic dashboard and configures a YouTube Channel ID
 2. **Members** visit the verification page, sign in with Discord (via Auth Gateway), then link their YouTube account via Google OAuth
-3. **Plugin** periodically checks each member's subscription status using the YouTube Data API
-4. **Subscribed members** automatically receive the configured Discord role; unsubscribed members have it removed
+3. **Plugin** checks the member's subscription **immediately** at link time (inline, using the freshly-issued token) and assigns the role before the page reloads — no waiting on the background worker
+4. **Plugin** then re-checks each member's subscription status periodically using the YouTube Data API to keep roles in sync
+5. **Subscribed members** keep the configured Discord role; unsubscribed members have it removed
 
 ## Tech Stack
 
@@ -94,7 +95,7 @@ All routes are nested under `/youtube-subscriber-role`:
 
 ## Refresh Timing
 
-The plugin checks subscription status periodically, scaled by user count and YouTube API quota (default 10,000 units/day):
+The **first** check happens inline the moment a member links their account, so they receive the role within seconds regardless of how many others are verifying at the same time. After that, the plugin re-checks subscription status periodically, scaled by user count and YouTube API quota (default 10,000 units/day):
 
 | Users | Active Check Interval | Inactive Check Interval |
 | ----- | --------------------- | ----------------------- |

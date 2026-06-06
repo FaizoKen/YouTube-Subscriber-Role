@@ -11,11 +11,21 @@ use serde_json::{json, Value};
 
 use crate::error::AppError;
 use crate::services::session;
-use crate::services::sync::PlayerSyncEvent;
+use crate::services::sync::{self, PlayerSyncEvent};
 use crate::services::youtube::YouTubeClient;
 use crate::AppState;
 
 const SESSION_COOKIE: &str = "rl_session";
+
+/// How far ahead to schedule the next background subscription check after the
+/// inline check done at link time. Matches the worker's 30-min floor, so we
+/// don't immediately re-spend quota re-checking a row we just checked.
+const INITIAL_RECHECK_SECS: i64 = 1800;
+
+/// When no role needs channel statistics, the subscribers-list stats are a
+/// nice-to-have — seed the row this far in the future so it fills in lazily
+/// instead of costing a YouTube call per user during a mass-verify spike.
+const DEFERRED_CHANNEL_STATS_HOURS: i64 = 6;
 
 /// Returns (discord_id, display_name)
 fn get_session(jar: &CookieJar, secret: &str) -> Result<(String, String), AppError> {
@@ -487,9 +497,8 @@ pub async fn youtube_callback(
     .execute(&state.pool)
     .await?;
 
-    // Seed subscription_cache for all channels configured in guilds this user is in.
-    // Guild membership lives in the Auth Gateway — query it over HTTP, then filter
-    // role_links locally.
+    // Resolve guild membership from the Auth Gateway (over HTTP), then filter
+    // role_links locally to find which YouTube channels matter for this user.
     let guild_ids = crate::services::auth_gateway::fetch_user_guild_ids(
         &state.http,
         &state.config.auth_gateway_url,
@@ -499,38 +508,169 @@ pub async fn youtube_callback(
     .await
     .unwrap_or_default();
 
-    if !guild_ids.is_empty() {
-        sqlx::query(
-            "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
-             SELECT DISTINCT $1, rl.channel_id, now() \
-             FROM role_links rl \
-             WHERE rl.guild_id = ANY($2) AND rl.channel_id IS NOT NULL \
-             ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",
+    // Whether any role link in the user's guilds uses conditions that depend on
+    // channel statistics. Plain "is subscribed" roles (the common case) don't,
+    // so we can skip the extra channels.list API call per user — which halves
+    // YouTube quota spend during a mass-verify spike. Default to eager on error.
+    let needs_channel_stats = if guild_ids.is_empty() {
+        false
+    } else {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM role_links \
+             WHERE guild_id = ANY($1) AND channel_id IS NOT NULL AND conditions <> '[]'::jsonb)",
         )
-        .bind(&discord_id)
         .bind(&guild_ids)
-        .execute(&state.pool)
-        .await?;
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(true)
+    };
+
+    // Inline subscription check using the access token we just obtained. This is
+    // the key to instant roles: instead of seeding next_check_at = now() and
+    // waiting for the single, rate-limited background worker to reach this row
+    // (which can lag for hours when hundreds verify at once after an @everyone
+    // ping), we check the user's subscription right here, write the real result,
+    // and sync their roles before this request returns. Best-effort: on any API
+    // error we fall back to seeding the row for the worker to retry.
+    let mut inline_status_known = false;
+    if !guild_ids.is_empty() {
+        let channel_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT rl.channel_id FROM role_links rl \
+             WHERE rl.guild_id = ANY($1) AND rl.channel_id IS NOT NULL",
+        )
+        .bind(&guild_ids)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap_or_default();
+
+        for channel_id in &channel_ids {
+            state.youtube_client.wait_for_permit().await;
+            match state
+                .youtube_client
+                .check_subscription(&tokens.access_token, channel_id)
+                .await
+            {
+                Ok(result) => {
+                    let next_check =
+                        chrono::Utc::now() + chrono::Duration::seconds(INITIAL_RECHECK_SECS);
+                    let _ = sqlx::query(
+                        "INSERT INTO subscription_cache \
+                         (discord_id, channel_id, is_subscribed, subscribed_at, checked_at, next_check_at, check_failures) \
+                         VALUES ($1, $2, $3, $4, now(), $5, 0) \
+                         ON CONFLICT (discord_id, channel_id) DO UPDATE SET \
+                           is_subscribed = $3, subscribed_at = $4, checked_at = now(), \
+                           next_check_at = $5, check_failures = 0",
+                    )
+                    .bind(&discord_id)
+                    .bind(channel_id)
+                    .bind(result.is_subscribed)
+                    .bind(result.subscribed_at)
+                    .bind(next_check)
+                    .execute(&state.pool)
+                    .await;
+                    inline_status_known = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        discord_id, channel_id,
+                        "Inline subscription check failed; deferring to worker: {e}"
+                    );
+                    let _ = sqlx::query(
+                        "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
+                         VALUES ($1, $2, now()) \
+                         ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",
+                    )
+                    .bind(&discord_id)
+                    .bind(channel_id)
+                    .execute(&state.pool)
+                    .await;
+                }
+            }
+        }
     }
 
-    // Seed channel_cache so the refresh worker fetches this user's YouTube channel
-    // stats (subscriber count, views, etc.) for the subscribers list page.
-    sqlx::query(
-        "INSERT INTO channel_cache (discord_id, next_check_at) \
-         VALUES ($1, now()) \
-         ON CONFLICT (discord_id) DO NOTHING",
-    )
-    .bind(&discord_id)
-    .execute(&state.pool)
-    .await?;
-
-    // Trigger role sync
-    let _ = state
-        .player_sync_tx
-        .send(PlayerSyncEvent::AccountLinked {
-            discord_id: discord_id.clone(),
-        })
+    // Channel stats power both stat-based conditions and the subscribers-list
+    // page. Fetch them inline only when a condition needs them (so the inline
+    // role sync below evaluates correctly); otherwise seed a deferred row so the
+    // subscribers page fills in later without spending quota during the spike.
+    if needs_channel_stats {
+        state.youtube_client.wait_for_permit().await;
+        match state
+            .youtube_client
+            .fetch_channel_stats(&tokens.access_token)
+            .await
+        {
+            Ok(stats) => {
+                let cc_next =
+                    chrono::Utc::now() + chrono::Duration::seconds(INITIAL_RECHECK_SECS * 2);
+                let _ = sqlx::query(
+                    "INSERT INTO channel_cache \
+                     (discord_id, subscriber_count, view_count, video_count, channel_created_at, \
+                      hidden_subscribers, country, custom_url, checked_at, next_check_at, check_failures) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, 0) \
+                     ON CONFLICT (discord_id) DO UPDATE SET \
+                       subscriber_count = $2, view_count = $3, video_count = $4, \
+                       channel_created_at = $5, hidden_subscribers = $6, country = $7, \
+                       custom_url = $8, checked_at = now(), next_check_at = $9, check_failures = 0",
+                )
+                .bind(&discord_id)
+                .bind(stats.subscriber_count)
+                .bind(stats.view_count)
+                .bind(stats.video_count)
+                .bind(stats.channel_created_at)
+                .bind(stats.hidden_subscriber_count)
+                .bind(&stats.country)
+                .bind(&stats.custom_url)
+                .bind(cc_next)
+                .execute(&state.pool)
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!(discord_id, "Inline channel stats fetch failed; deferring: {e}");
+                let _ = sqlx::query(
+                    "INSERT INTO channel_cache (discord_id, next_check_at) VALUES ($1, now()) \
+                     ON CONFLICT (discord_id) DO NOTHING",
+                )
+                .bind(&discord_id)
+                .execute(&state.pool)
+                .await;
+            }
+        }
+    } else {
+        let deferred =
+            chrono::Utc::now() + chrono::Duration::hours(DEFERRED_CHANNEL_STATS_HOURS);
+        let _ = sqlx::query(
+            "INSERT INTO channel_cache (discord_id, next_check_at) VALUES ($1, $2) \
+             ON CONFLICT (discord_id) DO NOTHING",
+        )
+        .bind(&discord_id)
+        .bind(deferred)
+        .execute(&state.pool)
         .await;
+    }
+
+    // Apply roles now. When we know the live subscription status, sync inline so
+    // the role is granted before the page reloads — and so a burst of linkers is
+    // handled in parallel across request tasks rather than funnelled through the
+    // single background sync worker. Fall back to the worker event otherwise.
+    if inline_status_known {
+        if let Err(e) = sync::sync_for_player(&discord_id, &state).await {
+            tracing::error!(discord_id, "Inline role sync after link failed: {e}");
+            let _ = state
+                .player_sync_tx
+                .send(PlayerSyncEvent::AccountLinked {
+                    discord_id: discord_id.clone(),
+                })
+                .await;
+        }
+    } else {
+        let _ = state
+            .player_sync_tx
+            .send(PlayerSyncEvent::AccountLinked {
+                discord_id: discord_id.clone(),
+            })
+            .await;
+    }
 
     tracing::info!(discord_id, "YouTube account linked");
 

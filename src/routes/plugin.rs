@@ -1,4 +1,11 @@
-use std::collections::HashMap;
+//! RoleLogic plugin contract: POST /register, GET/POST/DELETE /config.
+//!
+//! The dashboard config UI uses **iframe mode** — RoleLogic embeds our own
+//! role-config page (`/admin/{guild}/role/{role_id}`, see [crate::routes::admin])
+//! and we own the entire save UX. `POST /config` is never called by iframe-mode
+//! plugins; the stub below verifies the token so a leaked/stale call cannot ping
+//! us silently.
+
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -8,9 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::AppError;
-use crate::models::condition::Condition;
 use crate::schema;
-use crate::services::sync::ConfigSyncEvent;
 use crate::AppState;
 
 fn extract_token(headers: &HeaderMap) -> Result<String, AppError> {
@@ -69,52 +74,32 @@ pub async fn get_config(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_token(&headers)?;
 
-    let link = sqlx::query_as::<_, (String, Option<String>, Value)>(
-        "SELECT guild_id, channel_id, conditions FROM role_links WHERE api_token = $1",
+    let link = sqlx::query_as::<_, (String, String)>(
+        "SELECT guild_id, role_id FROM role_links WHERE api_token = $1",
     )
     .bind(&token)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::Unauthorized)?;
 
-    let (guild_id, channel_id, raw_conditions) = link;
+    let (guild_id, role_id) = link;
 
-    // Deserialize conditions with tolerance for old format
-    let conditions: Vec<Condition> = raw_conditions
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Condition>(v.clone()).ok())
-        .collect();
-
-    let view_permission: String = sqlx::query_scalar(
-        "SELECT view_permission FROM guild_settings WHERE guild_id = $1",
-    )
-    .bind(&guild_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .unwrap_or_else(|| "members".to_string());
-
-    let verify_url = format!("{}/verify?guild={}", state.config.base_url, guild_id);
-    let subscribers_url = format!("{}/subscribers/{}", state.config.base_url, guild_id);
-    let schema = schema::build_config_schema(
-        channel_id.as_deref(),
-        &conditions,
-        &verify_url,
-        &subscribers_url,
-        &view_permission,
-    );
-
-    Ok(Json(schema))
+    Ok(Json(schema::build_iframe_config(
+        &state.config.base_url,
+        &guild_id,
+        &role_id,
+    )))
 }
 
 #[derive(Deserialize)]
 pub struct ConfigBody {
     pub guild_id: String,
     pub role_id: String,
-    pub config: HashMap<String, Value>,
 }
 
+/// Iframe-mode no-op. The dashboard never calls this; the real save lives in
+/// [crate::routes::admin::role_config_save]. We still verify the token so a
+/// stale/leaked call from a downgraded backend can't ping silently.
 pub async fn post_config(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -122,7 +107,6 @@ pub async fn post_config(
 ) -> Result<Json<Value>, AppError> {
     let token = extract_token(&headers)?;
 
-    // Verify token matches this role link
     let exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM role_links WHERE guild_id = $1 AND role_id = $2 AND api_token = $3)",
     )
@@ -137,91 +121,7 @@ pub async fn post_config(
         return Err(AppError::Unauthorized);
     }
 
-    let (channel_id, conditions) = schema::parse_config(&body.config)?;
-
-    // Parse view_permission (server-wide setting stored in guild_settings)
-    let view_permission = body.config
-        .get("view_permission")
-        .and_then(|v| v.as_str())
-        .unwrap_or("members")
-        .to_string();
-    if view_permission != "members" && view_permission != "managers" {
-        return Err(AppError::BadRequest(
-            "view_permission must be 'members' or 'managers'".into(),
-        ));
-    }
-
-    // Transaction for role_links + guild_settings (must be consistent)
-    let mut tx = state.pool.begin().await?;
-
-    sqlx::query(
-        "UPDATE role_links SET channel_id = $1, conditions = $2, updated_at = now() \
-         WHERE guild_id = $3 AND role_id = $4",
-    )
-    .bind(&channel_id)
-    .bind(serde_json::json!(&conditions))
-    .bind(&body.guild_id)
-    .bind(&body.role_id)
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO guild_settings (guild_id, view_permission, updated_at) \
-         VALUES ($1, $2, now()) \
-         ON CONFLICT (guild_id) \
-         DO UPDATE SET view_permission = EXCLUDED.view_permission, updated_at = now()",
-    )
-    .bind(&body.guild_id)
-    .bind(&view_permission)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    // Seed subscription_cache rows for all linked accounts for this channel
-    // so the refresh worker picks them up. No guild filtering needed here —
-    // the sync engine handles guild scoping via Auth Gateway.
-    sqlx::query(
-        "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
-         SELECT la.discord_id, $1, now() \
-         FROM linked_accounts la \
-         ON CONFLICT (discord_id, channel_id) DO NOTHING",
-    )
-    .bind(&channel_id)
-    .execute(&state.pool)
-    .await?;
-
-    // If conditions need channel stats, seed channel_cache rows too
-    let needs_channel_cache = conditions
-        .iter()
-        .any(|c| c.field.needs_channel_cache());
-
-    if needs_channel_cache {
-        sqlx::query(
-            "INSERT INTO channel_cache (discord_id, next_check_at) \
-             SELECT la.discord_id, now() \
-             FROM linked_accounts la \
-             ON CONFLICT (discord_id) DO NOTHING",
-        )
-        .execute(&state.pool)
-        .await?;
-    }
-
-    tracing::info!(
-        guild_id = body.guild_id,
-        role_id = body.role_id,
-        channel_id,
-        condition_count = conditions.len(),
-        "Config updated"
-    );
-
-    // Trigger re-evaluation for this role link
-    let _ = state.config_sync_tx.send(ConfigSyncEvent {
-        guild_id: body.guild_id,
-        role_id: body.role_id,
-    }).await;
-
-    Ok(Json(serde_json::json!({"success": true})))
+    Ok(Json(schema::accept_empty_config()))
 }
 
 #[derive(Deserialize)]

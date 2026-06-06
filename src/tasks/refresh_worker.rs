@@ -5,8 +5,8 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::error::YouTubeError;
-use crate::models::condition::Condition;
-use crate::services::sync::{self, PlayerSyncEvent};
+use crate::models::rule::RuleTree;
+use crate::services::sync::PlayerSyncEvent;
 use crate::AppState;
 
 const MIN_REFRESH_SECS: i64 = 1800; // 30 min floor
@@ -81,27 +81,20 @@ impl CachedInterval {
         self.needs_channel_stats.load(Ordering::Relaxed)
     }
 
-    /// Check if any role_link has conditions that require channel_cache data.
+    /// Check if any role_link rule tree references the member's own channel
+    /// stats (and therefore needs `channel_cache` data fetched).
     async fn check_needs_channel_stats(&self, pool: &sqlx::PgPool) -> bool {
-        let rows: Vec<serde_json::Value> = sqlx::query_scalar(
-            "SELECT conditions FROM role_links WHERE channel_id IS NOT NULL AND conditions != '[]'::jsonb",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+        let rows: Vec<serde_json::Value> =
+            sqlx::query_scalar("SELECT rule_tree FROM role_links")
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
 
-        for raw in &rows {
-            let conditions: Vec<Condition> = raw
-                .as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|v| serde_json::from_value::<Condition>(v.clone()).ok())
-                .collect();
-            if sync::conditions_need_channel_cache(&conditions) {
-                return true;
-            }
-        }
-        false
+        rows.iter().any(|raw| {
+            serde_json::from_value::<RuleTree>(raw.clone())
+                .map(|t| t.needs_channel_cache())
+                .unwrap_or(false)
+        })
     }
 }
 

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, CookieJar};
@@ -397,7 +396,7 @@ pub async fn verify_page(State(state): State<Arc<AppState>>) -> impl IntoRespons
     )
 }
 
-pub async fn login(State(state): State<Arc<AppState>>) -> Response {
+pub async fn login(State(_state): State<Arc<AppState>>) -> Response {
     let return_to = "/youtube-subscriber-role/verify";
     let url = format!(
         "/auth/login?return_to={}",
@@ -508,21 +507,28 @@ pub async fn youtube_callback(
     .await
     .unwrap_or_default();
 
-    // Whether any role link in the user's guilds uses conditions that depend on
-    // channel statistics. Plain "is subscribed" roles (the common case) don't,
-    // so we can skip the extra channels.list API call per user — which halves
-    // YouTube quota spend during a mass-verify spike. Default to eager on error.
+    // Whether any role link in the user's guilds uses a rule that depends on
+    // the member's own channel statistics. Plain "is subscribed" roles (the
+    // common case) don't, so we can skip the extra channels.list API call per
+    // user — which halves YouTube quota spend during a mass-verify spike.
+    // Default to eager on error.
     let needs_channel_stats = if guild_ids.is_empty() {
         false
     } else {
-        sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM role_links \
-             WHERE guild_id = ANY($1) AND channel_id IS NOT NULL AND conditions <> '[]'::jsonb)",
+        let trees: Vec<Value> = sqlx::query_scalar(
+            "SELECT rule_tree FROM role_links WHERE guild_id = ANY($1)",
         )
         .bind(&guild_ids)
-        .fetch_one(&state.pool)
+        .fetch_all(&state.pool)
         .await
-        .unwrap_or(true)
+        .unwrap_or_default();
+        // On a DB error we get an empty list → not eager; but the more likely
+        // failure (a malformed tree) is handled per-row by defaulting to false.
+        trees.iter().any(|raw| {
+            serde_json::from_value::<crate::models::rule::RuleTree>(raw.clone())
+                .map(|t| t.needs_channel_cache())
+                .unwrap_or(false)
+        })
     };
 
     // Inline subscription check using the access token we just obtained. This is

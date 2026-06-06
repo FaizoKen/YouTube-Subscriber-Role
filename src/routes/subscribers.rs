@@ -580,6 +580,13 @@ pub async fn subscribers_data(
             "No subscriber list is configured for this server.".into(),
         ));
     }
+    // Server admin turned the public list off entirely — no one (managers
+    // included) can view it.
+    if view_permission == "disabled" {
+        return Err(AppError::Forbidden(
+            "The subscriber list is turned off for this server.".into(),
+        ));
+    }
     let members_allowed = view_permission == "members";
 
     // 3. Ask Auth Gateway for guild membership and permissions.

@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use futures_util::stream::{self, StreamExt};
 
 use crate::error::AppError;
-use crate::models::condition::{Condition, ConditionField, ConditionOperator};
+use crate::models::rule::RuleTree;
 use crate::services::auth_gateway;
 use crate::services::condition_eval::{self, PlayerYouTubeData};
+use crate::services::rule_sql::{self, Bind};
 use crate::AppState;
 
 /// Events sent to the player sync worker (lightweight, per-user).
@@ -23,101 +24,10 @@ pub struct ConfigSyncEvent {
     pub role_id: String,
 }
 
-// ---------------------------------------------------------------------------
-// SQL condition builder
-// ---------------------------------------------------------------------------
-
-enum ConditionBind {
-    Int(i64),
-    Text(String),
-}
-
-/// Build a SQL WHERE clause from conditions.
-/// Returns (where_clause, bind_values, needs_channel_cache_join).
-/// Bind parameter indices start at `bind_offset + 1`.
-fn build_condition_where(
-    conditions: &[Condition],
-    bind_offset: usize,
-) -> (String, Vec<ConditionBind>, bool) {
-    if conditions.is_empty() {
-        return ("TRUE".to_string(), vec![], false);
-    }
-
-    let mut clauses: Vec<String> = Vec::new();
-    let mut binds: Vec<ConditionBind> = Vec::new();
-    let mut needs_cc = false;
-
-    for condition in conditions {
-        if condition.field.needs_channel_cache() {
-            needs_cc = true;
-        }
-
-        match &condition.field {
-            // --- Boolean field: HasCustomUrl ---
-            ConditionField::HasCustomUrl => {
-                clauses.push(
-                    "cc.custom_url IS NOT NULL AND cc.custom_url != ''".to_string(),
-                );
-            }
-
-            // --- String field: Country (Eq only) ---
-            ConditionField::Country => {
-                let val = condition.value.as_str().unwrap_or("").to_uppercase();
-                let idx = bind_offset + binds.len() + 1;
-                clauses.push(format!("UPPER(cc.country) = ${idx}"));
-                binds.push(ConditionBind::Text(val));
-            }
-
-            // --- Numeric fields ---
-            field => {
-                // For SubscriberCount: require hidden_subscribers = FALSE
-                if matches!(field, ConditionField::SubscriberCount) {
-                    clauses.push("cc.hidden_subscribers = FALSE".to_string());
-                }
-
-                let expr = field.sql_expr().expect("numeric field must have sql_expr");
-                let val = condition.value.as_i64().unwrap_or(0);
-
-                if matches!(condition.operator, ConditionOperator::Between) {
-                    let end = condition
-                        .value_end
-                        .as_ref()
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(val);
-                    let idx_start = bind_offset + binds.len() + 1;
-                    let idx_end = bind_offset + binds.len() + 2;
-                    clauses.push(format!(
-                        "({expr}) >= ${idx_start} AND ({expr}) <= ${idx_end}"
-                    ));
-                    binds.push(ConditionBind::Int(val));
-                    binds.push(ConditionBind::Int(end));
-                } else {
-                    let op = condition.operator.sql_operator();
-                    let idx = bind_offset + binds.len() + 1;
-                    clauses.push(format!("({expr}) {op} ${idx}"));
-                    binds.push(ConditionBind::Int(val));
-                }
-
-                // For age fields, require the timestamp to be NOT NULL
-                match field {
-                    ConditionField::SubscriptionAgeDays => {
-                        clauses.push("sc.subscribed_at IS NOT NULL".to_string());
-                    }
-                    ConditionField::ChannelAgeDays => {
-                        clauses.push("cc.channel_created_at IS NOT NULL".to_string());
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    (clauses.join(" AND "), binds, needs_cc)
-}
-
-/// Check if any condition in the list needs channel_cache data.
-pub fn conditions_need_channel_cache(conditions: &[Condition]) -> bool {
-    conditions.iter().any(|c| c.field.needs_channel_cache())
+/// Parse the stored `rule_tree` JSONB, tolerating malformed rows (treated as
+/// "grant to nobody" — the safe default).
+fn parse_rule_tree(raw: &serde_json::Value) -> RuleTree {
+    serde_json::from_value::<RuleTree>(raw.clone()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -125,11 +35,9 @@ pub fn conditions_need_channel_cache(conditions: &[Condition]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Sync roles for a single player across all guilds.
-/// Checks subscription_cache + conditions for each role link, then adds/removes roles.
-pub async fn sync_for_player(
-    discord_id: &str,
-    state: &AppState,
-) -> Result<(), AppError> {
+/// Evaluates each role link's rule tree against the player's cached facts, then
+/// adds/removes roles to match.
+pub async fn sync_for_player(discord_id: &str, state: &AppState) -> Result<(), AppError> {
     let pool = &state.pool;
     let rl_client = &state.rl_client;
 
@@ -146,11 +54,12 @@ pub async fn sync_for_player(
         return Ok(());
     }
 
-    // Get role links for guilds this user is a member of (only those with a configured channel)
-    let role_links = sqlx::query_as::<_, (String, String, String, String, serde_json::Value)>(
-        "SELECT rl.guild_id, rl.role_id, rl.api_token, rl.channel_id, rl.conditions \
+    // All role links for guilds this user is a member of. Channel may be NULL
+    // for channel-agnostic ("anyone who linked") rules.
+    let role_links = sqlx::query_as::<_, (String, String, String, Option<String>, serde_json::Value)>(
+        "SELECT rl.guild_id, rl.role_id, rl.api_token, rl.channel_id, rl.rule_tree \
          FROM role_links rl \
-         WHERE rl.guild_id = ANY($1) AND rl.channel_id IS NOT NULL",
+         WHERE rl.guild_id = ANY($1)",
     )
     .bind(&guild_ids[..])
     .fetch_all(pool)
@@ -170,7 +79,7 @@ pub async fn sync_for_player(
     .into_iter()
     .collect();
 
-    // Pre-load channel_cache data for this user (needed for channel stat conditions)
+    // Pre-load channel_cache data for this user (the member's own channel stats)
     let channel_data = sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>, Option<chrono::DateTime<chrono::Utc>>, bool, Option<String>, Option<String>)>(
         "SELECT subscriber_count, view_count, video_count, channel_created_at, hidden_subscribers, \
          country, custom_url \
@@ -186,45 +95,37 @@ pub async fn sync_for_player(
     }
 
     let mut actions: Vec<Action> = Vec::new();
-    for (guild_id, role_id, api_token, channel_id, raw_conditions) in &role_links {
-        // Deserialize conditions with tolerance for old format
-        let conditions: Vec<Condition> = raw_conditions
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter_map(|v| serde_json::from_value::<Condition>(v.clone()).ok())
-            .collect();
+    for (guild_id, role_id, api_token, channel_id, raw_tree) in &role_links {
+        let tree = parse_rule_tree(raw_tree);
 
-        // Check subscription status + subscribed_at from cache
-        let sub_row = sqlx::query_as::<_, (bool, Option<chrono::DateTime<chrono::Utc>>)>(
-            "SELECT is_subscribed, subscribed_at FROM subscription_cache \
-             WHERE discord_id = $1 AND channel_id = $2",
-        )
-        .bind(discord_id)
-        .bind(channel_id)
-        .fetch_optional(pool)
-        .await?;
-
-        let (is_subscribed, subscribed_at) = sub_row.unwrap_or((false, None));
-
-        // Determine if user qualifies
-        let qualifies = if !is_subscribed {
-            false
-        } else if conditions.is_empty() {
-            true
+        // Subscription facts for this link's configured channel (if any).
+        let (is_subscribed, subscribed_at) = if let Some(channel_id) = channel_id {
+            sqlx::query_as::<_, (bool, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT is_subscribed, subscribed_at FROM subscription_cache \
+                 WHERE discord_id = $1 AND channel_id = $2",
+            )
+            .bind(discord_id)
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or((false, None))
         } else {
-            let yt_data = PlayerYouTubeData {
-                subscribed_at,
-                subscriber_count: channel_data.as_ref().and_then(|d| d.0),
-                view_count: channel_data.as_ref().and_then(|d| d.1),
-                video_count: channel_data.as_ref().and_then(|d| d.2),
-                channel_created_at: channel_data.as_ref().and_then(|d| d.3),
-                hidden_subscribers: channel_data.as_ref().map_or(false, |d| d.4),
-                country: channel_data.as_ref().and_then(|d| d.5.clone()),
-                custom_url: channel_data.as_ref().and_then(|d| d.6.clone()),
-            };
-            condition_eval::evaluate_conditions(&conditions, &yt_data)
+            (false, None)
         };
+
+        let facts = PlayerYouTubeData {
+            is_subscribed,
+            subscribed_at,
+            subscriber_count: channel_data.as_ref().and_then(|d| d.0),
+            view_count: channel_data.as_ref().and_then(|d| d.1),
+            video_count: channel_data.as_ref().and_then(|d| d.2),
+            channel_created_at: channel_data.as_ref().and_then(|d| d.3),
+            hidden_subscribers: channel_data.as_ref().is_some_and(|d| d.4),
+            country: channel_data.as_ref().and_then(|d| d.5.clone()),
+            custom_url: channel_data.as_ref().and_then(|d| d.6.clone()),
+        };
+
+        let qualifies = condition_eval::evaluate_rule_tree(&tree, &facts);
 
         let currently_assigned = existing.contains(&(guild_id.clone(), role_id.clone()));
         match (qualifies, currently_assigned) {
@@ -326,8 +227,8 @@ pub async fn sync_for_player(
 // Per-role-link sync (bulk, after config change)
 // ---------------------------------------------------------------------------
 
-/// Re-evaluate all users for a specific role link (after config change).
-/// Uses dynamic SQL query with condition WHERE clause + atomic PUT replace.
+/// Re-evaluate all members for a specific role link (after config change).
+/// Pushes the rule tree down to a single SQL query + atomic PUT replace.
 pub async fn sync_for_role_link(
     guild_id: &str,
     role_id: &str,
@@ -337,24 +238,17 @@ pub async fn sync_for_role_link(
     let rl_client = &state.rl_client;
 
     let link = sqlx::query_as::<_, (String, Option<String>, serde_json::Value)>(
-        "SELECT api_token, channel_id, conditions FROM role_links WHERE guild_id = $1 AND role_id = $2",
+        "SELECT api_token, channel_id, rule_tree FROM role_links WHERE guild_id = $1 AND role_id = $2",
     )
     .bind(guild_id)
     .bind(role_id)
     .fetch_optional(pool)
     .await?;
 
-    let Some((api_token, Some(channel_id), raw_conditions)) = link else {
+    let Some((api_token, channel_id, raw_tree)) = link else {
         return Ok(());
     };
-
-    // Deserialize conditions with tolerance for old format
-    let conditions: Vec<Condition> = raw_conditions
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|v| serde_json::from_value::<Condition>(v.clone()).ok())
-        .collect();
+    let tree = parse_rule_tree(&raw_tree);
 
     let member_ids = auth_gateway::fetch_guild_member_ids(
         &state.http,
@@ -394,36 +288,28 @@ pub async fn sync_for_role_link(
         Err(_) => (0, 100),
     };
 
-    // Build dynamic condition WHERE clause
-    // Fixed binds: $1 = channel_id, $2 = member_ids, then condition binds, then limit
-    let (cond_where, cond_binds, needs_cc) = build_condition_where(&conditions, 2);
-
-    let limit_idx = 2 + cond_binds.len() + 1;
-
-    let cc_join = if needs_cc {
-        "LEFT JOIN channel_cache cc ON cc.discord_id = la.discord_id"
-    } else {
-        ""
-    };
+    // Build the DNF WHERE clause. Fixed binds: $1 = channel_id (empty when the
+    // rule is channel-agnostic — subscription conditions then fail closed),
+    // $2 = member_ids, then rule binds (offset 2), then limit.
+    let (rule_where, rule_binds) = rule_sql::build_rule_where(&tree, 2);
+    let limit_idx = 2 + rule_binds.len() + 1;
 
     let query_str = format!(
         "SELECT la.discord_id \
          FROM linked_accounts la \
-         JOIN subscription_cache sc ON sc.discord_id = la.discord_id AND sc.channel_id = $1 \
-         {cc_join} \
+         LEFT JOIN subscription_cache sc ON sc.discord_id = la.discord_id AND sc.channel_id = $1 \
+         LEFT JOIN channel_cache cc ON cc.discord_id = la.discord_id \
          WHERE la.discord_id = ANY($2::text[]) \
-           AND sc.is_subscribed = TRUE \
-           AND ({cond_where}) \
+           AND ({rule_where}) \
          ORDER BY la.linked_at ASC \
          LIMIT ${limit_idx}",
     );
 
-    // Execute the dynamic query
-    let qualifying_ids = exec_condition_query(
+    let qualifying_ids = exec_rule_query(
         &query_str,
-        &channel_id,
+        channel_id.as_deref().unwrap_or(""),
         &member_ids,
-        &cond_binds,
+        &rule_binds,
         user_limit,
         pool,
     )
@@ -466,29 +352,27 @@ pub async fn sync_for_role_link(
     Ok(())
 }
 
-/// Execute a dynamically-built condition query with variable bind counts.
-async fn exec_condition_query(
+/// Execute a dynamically-built rule query with variable bind counts.
+async fn exec_rule_query(
     query: &str,
     channel_id: &str,
     member_ids: &[String],
-    cond_binds: &[ConditionBind],
+    rule_binds: &[Bind],
     limit: usize,
     pool: &sqlx::PgPool,
 ) -> Result<Vec<String>, AppError> {
     let mut q = sqlx::query_scalar::<_, String>(query);
-    q = q.bind(channel_id);        // $1
-    q = q.bind(member_ids);         // $2
-    for bind in cond_binds {
-        match bind {
-            ConditionBind::Int(v) => {
-                q = q.bind(*v);
-            }
-            ConditionBind::Text(v) => {
-                q = q.bind(v.as_str());
-            }
-        }
+    q = q.bind(channel_id.to_string()); // $1
+    q = q.bind(member_ids.to_vec()); // $2
+    for bind in rule_binds {
+        q = match bind {
+            Bind::Bool(v) => q.bind(*v),
+            Bind::Int(v) => q.bind(*v),
+            Bind::Text(v) => q.bind(v.clone()),
+            Bind::TextArray(v) => q.bind(v.clone()),
+        };
     }
-    q = q.bind(limit as i64);      // last bind
+    q = q.bind(limit as i64); // last bind
     Ok(q.fetch_all(pool).await?)
 }
 
@@ -497,10 +381,7 @@ async fn exec_condition_query(
 // ---------------------------------------------------------------------------
 
 /// Remove a user from all role assignments (after account unlink).
-pub async fn remove_all_assignments(
-    discord_id: &str,
-    state: &AppState,
-) -> Result<(), AppError> {
+pub async fn remove_all_assignments(discord_id: &str, state: &AppState) -> Result<(), AppError> {
     let pool = &state.pool;
     let rl_client = &state.rl_client;
 

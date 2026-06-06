@@ -16,6 +16,14 @@ pub struct AppConfig {
     /// Shared secret for plugin → gateway /auth/internal/* calls
     /// (sent in the `X-Internal-Key` header). Must match INTERNAL_API_KEY on the gateway.
     pub internal_api_key: String,
+    /// Origin of the RoleLogic dashboard that embeds the iframe role-config page,
+    /// used for the `frame-ancestors` CSP. `None` falls back to `*` (dev /
+    /// self-hosted RoleLogic). Set explicitly in prod, e.g. https://app.rolelogic.com.
+    pub rl_dashboard_origin: Option<String>,
+    /// Origins accepted on cookie-authenticated state-changing admin requests
+    /// (server-side CSRF defense). Our own origin (derived from BASE_URL) plus
+    /// the dashboard origin when configured.
+    pub allowed_origins: Vec<String>,
 }
 
 /// Extract the origin (scheme://host[:port]) from BASE_URL, dropping any path prefix.
@@ -37,6 +45,22 @@ impl AppConfig {
             .map(|s| s.trim_end_matches('/').to_string())
             .unwrap_or_else(|| derive_origin(&base_url));
 
+        let rl_dashboard_origin = env::var("RL_DASHBOARD_ORIGIN")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+
+        // Server-side CSRF allowlist: our own origin always, plus the
+        // dashboard origin when set (the dashboard never posts directly to our
+        // admin XHRs — those carry the iframe-session Bearer — but allowlisting
+        // it keeps direct-nav-from-dashboard edge cases working).
+        let mut allowed_origins = vec![derive_origin(&base_url)];
+        if let Some(ref origin) = rl_dashboard_origin {
+            if !allowed_origins.iter().any(|o| o == origin) {
+                allowed_origins.push(origin.clone());
+            }
+        }
+
         Self {
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             google_client_id: env::var("GOOGLE_CLIENT_ID")
@@ -53,6 +77,8 @@ impl AppConfig {
             auth_gateway_url,
             internal_api_key: env::var("INTERNAL_API_KEY")
                 .expect("INTERNAL_API_KEY must be set (must match the Auth Gateway's value)"),
+            rl_dashboard_origin,
+            allowed_origins,
         }
     }
 

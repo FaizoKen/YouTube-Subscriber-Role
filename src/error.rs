@@ -34,6 +34,9 @@ pub enum AppError {
     #[error("Not found: {0}")]
     NotFound(String),
 
+    #[error("Configuration changed in another tab")]
+    StaleVersion,
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -85,6 +88,10 @@ impl IntoResponse for AppError {
             AppError::UnauthorizedWith(msg) => (StatusCode::UNAUTHORIZED, msg.as_str()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.as_str()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.as_str()),
+            AppError::StaleVersion => (
+                StatusCode::CONFLICT,
+                "Configuration was changed in another tab. Reload to get the latest, then re-apply.",
+            ),
             AppError::Internal(e) => {
                 tracing::error!("Internal error: {e}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")

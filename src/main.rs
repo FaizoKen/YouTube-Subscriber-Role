@@ -90,6 +90,15 @@ async fn main() {
             // Subscribers list (user-facing, auth via cookie)
             .route("/subscribers/{guild_id}", get(routes::subscribers::subscribers_page))
             .route("/subscribers/{guild_id}/data", get(routes::subscribers::subscribers_data))
+            // Admin role-config (iframe UI mode)
+            .route("/admin/{guild_id}/role/{role_id}", get(routes::admin::role_config_page))
+            .route("/admin/{guild_id}/role/{role_id}/data", get(routes::admin::role_config_data))
+            .route("/admin/{guild_id}/role/{role_id}/save", post(routes::admin::role_config_save))
+            .route(
+                "/admin/{guild_id}/role/{role_id}/preview",
+                get(routes::admin::role_config_preview).post(routes::admin::role_config_preview_edit),
+            )
+            .route("/admin/{guild_id}/view-permission", post(routes::admin::set_view_permission))
             // Verification endpoints (user-facing)
             .route("/verify", get(routes::verification::verify_page))
             .route("/verify/login", get(routes::verification::login))
@@ -103,6 +112,9 @@ async fn main() {
             .route("/favicon.ico", get(routes::health::favicon))
             .route("/health", get(routes::health::health))
         )
+        .layer(axum::middleware::from_fn(
+            services::security_headers::baseline,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

@@ -6,11 +6,11 @@ A [RoleLogic](https://rolelogic.faizo.net) plugin server that automatically assi
 
 ## How It Works
 
-1. **Admin** creates a role link in the RoleLogic dashboard and configures a YouTube Channel ID
+1. **Admin** creates a role link in the RoleLogic dashboard. The plugin uses **iframe UI mode** (BLUEPRINT §1b): RoleLogic embeds the plugin's own rule-builder page, where the admin enters the YouTube Channel ID and picks a preset (*Anyone subscribed*, *Long-time subscribers ≥ N days*, *Subscribers with an established channel ≥ N subs*, *Anyone who linked YouTube*) or builds an advanced **OR-of-AND** rule across subscription + channel-stat conditions, with a live "X of Y members match" preview
 2. **Members** visit the verification page, sign in with Discord (via Auth Gateway), then link their YouTube account via Google OAuth
 3. **Plugin** checks the member's subscription **immediately** at link time (inline, using the freshly-issued token) and assigns the role before the page reloads — no waiting on the background worker
 4. **Plugin** then re-checks each member's subscription status periodically using the YouTube Data API to keep roles in sync
-5. **Subscribed members** keep the configured Discord role; unsubscribed members have it removed
+5. **Qualifying members** keep the configured Discord role; those who no longer match have it removed
 
 ## Tech Stack
 
@@ -41,6 +41,9 @@ SESSION_SECRET=random_secret_string       # must match Auth Gateway
 BASE_URL=https://your-domain.com/youtube-subscriber-role
 LISTEN_ADDR=0.0.0.0:8080
 YOUTUBE_QUOTA_PER_DAY=10000
+# Origin of the RoleLogic dashboard that embeds the iframe config page (CSP
+# frame-ancestors). Leave unset for `*` in dev; set explicitly in production.
+RL_DASHBOARD_ORIGIN=https://app.rolelogic.com
 ```
 
 ### Google OAuth Setup
@@ -69,12 +72,24 @@ All routes are nested under `/youtube-subscriber-role`:
 
 ### RoleLogic Plugin (called by RoleLogic dashboard)
 
-| Method   | Path        | Purpose                        |
-| -------- | ----------- | ------------------------------ |
-| `POST`   | `/register` | Acknowledge role link creation |
-| `GET`    | `/config`   | Return config form schema      |
-| `POST`   | `/config`   | Save YouTube Channel ID        |
-| `DELETE` | `/config`   | Clean up on role link deletion |
+| Method   | Path        | Purpose                                              |
+| -------- | ----------- | --------------------------------------------------- |
+| `POST`   | `/register` | Acknowledge role link creation                      |
+| `GET`    | `/config`   | Return iframe-mode config (`ui_mode: "iframe"`)     |
+| `POST`   | `/config`   | No-op stub (token-verified; never called in iframe) |
+| `DELETE` | `/config`   | Clean up on role link deletion                      |
+
+### Admin Rule Builder (iframe UI, dual-mode auth)
+
+Embedded by the dashboard; also reachable directly (cookie + Manage Server).
+
+| Method     | Path                                       | Purpose                                       |
+| ---------- | ------------------------------------------ | --------------------------------------------- |
+| `GET`      | `/admin/{guild}/role/{role}`               | Rule-builder page (verifies `?rl_token=` JWT) |
+| `GET`      | `/admin/{guild}/role/{role}/data`          | Current rule + target/operator catalogs       |
+| `POST`     | `/admin/{guild}/role/{role}/save`          | Save rule tree (optimistic-locked)            |
+| `GET/POST` | `/admin/{guild}/role/{role}/preview`       | Count matching members (saved / proposed)     |
+| `POST`     | `/admin/{guild}/view-permission`           | Set subscribers-list visibility               |
 
 ### User Verification
 

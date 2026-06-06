@@ -551,8 +551,17 @@ pub async fn youtube_callback(
                 .await
             {
                 Ok(result) => {
-                    let next_check =
-                        chrono::Utc::now() + chrono::Duration::seconds(INITIAL_RECHECK_SECS);
+                    // If they're not subscribed yet (linked before subscribing, or
+                    // YouTube's API hasn't surfaced a just-made subscription), start
+                    // the worker's fast re-check cadence so the role lands within a
+                    // minute or two with no user action; otherwise use the normal
+                    // post-link interval.
+                    let next_check = chrono::Utc::now()
+                        + chrono::Duration::seconds(if result.is_subscribed {
+                            INITIAL_RECHECK_SECS
+                        } else {
+                            crate::tasks::refresh_worker::FAST_RETRY_SECS
+                        });
                     let _ = sqlx::query(
                         "INSERT INTO subscription_cache \
                          (discord_id, channel_id, is_subscribed, subscribed_at, checked_at, next_check_at, check_failures) \

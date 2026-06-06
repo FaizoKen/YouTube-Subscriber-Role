@@ -19,6 +19,17 @@ const INACTIVE_MULTIPLIER: i64 = 6;
 /// Channel stats change slowly — refresh at 2x the subscription interval.
 const CHANNEL_STATS_MULTIPLIER: i64 = 2;
 
+/// A freshly linked user we haven't yet confirmed as subscribed is re-checked
+/// this often, so a just-made subscription — or one YouTube's API was briefly
+/// slow to surface — is picked up within a minute or two instead of waiting for
+/// the normal (slow) inactive cadence.
+pub const FAST_RETRY_SECS: i64 = 90;
+
+/// How long after linking the fast re-check window stays open. After this, a
+/// still-unsubscribed user falls back to the normal cadence so someone who
+/// links but never subscribes stops costing quota.
+pub const FAST_RETRY_WINDOW_SECS: i64 = 600;
+
 /// Caches the refresh interval to avoid running COUNT(*) on every fetch cycle.
 struct CachedInterval {
     value: AtomicI64,
@@ -105,10 +116,11 @@ pub async fn run(state: Arc<AppState>) {
         state.youtube_client.wait_for_permit().await;
 
         // Get next subscription check due, prioritizing active users
-        let next = sqlx::query_as::<_, (String, String, String, String, chrono::DateTime<chrono::Utc>, bool)>(
+        let next = sqlx::query_as::<_, (String, String, String, String, chrono::DateTime<chrono::Utc>, bool, chrono::DateTime<chrono::Utc>)>(
             "SELECT sc.discord_id, sc.channel_id, la.google_access_token, la.google_refresh_token, \
              la.google_token_expires_at, \
-             EXISTS(SELECT 1 FROM role_assignments ra WHERE ra.discord_id = sc.discord_id) as is_active \
+             EXISTS(SELECT 1 FROM role_assignments ra WHERE ra.discord_id = sc.discord_id) as is_active, \
+             la.linked_at \
              FROM subscription_cache sc \
              JOIN linked_accounts la ON la.discord_id = sc.discord_id \
              WHERE sc.next_check_at <= now() \
@@ -118,7 +130,7 @@ pub async fn run(state: Arc<AppState>) {
         .fetch_optional(&state.pool)
         .await;
 
-        let (discord_id, channel_id, mut access_token, refresh_token, token_expires_at, is_active) = match next {
+        let (discord_id, channel_id, mut access_token, refresh_token, token_expires_at, is_active, linked_at) = match next {
             Ok(Some(row)) => row,
             Ok(None) => {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -192,7 +204,17 @@ pub async fn run(state: Arc<AppState>) {
             Ok(result) => {
                 let base_interval = cached_interval.get(&state.pool).await;
                 let multiplier = if is_active { 1 } else { INACTIVE_MULTIPLIER };
-                let interval = base_interval * multiplier;
+                // Keep a freshly linked user we still don't see as subscribed on the
+                // fast cadence (bounded to FAST_RETRY_WINDOW_SECS after linking) so a
+                // just-made / API-lagged subscription lands the role within a minute
+                // or two with no user action. Everyone else uses the normal cadence.
+                let within_fast_window =
+                    (chrono::Utc::now() - linked_at).num_seconds() < FAST_RETRY_WINDOW_SECS;
+                let interval = if !result.is_subscribed && within_fast_window {
+                    FAST_RETRY_SECS
+                } else {
+                    base_interval * multiplier
+                };
                 let next_check = chrono::Utc::now() + chrono::Duration::seconds(interval);
 
                 if let Err(e) = sqlx::query(

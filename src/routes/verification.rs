@@ -94,6 +94,13 @@ pub fn render_verify_page(base_url: &str) -> String {
         .guild-ctx.warn {{ background: #1c1208; border-color: #422006; color: #fbbf24; }}
         .guild-ctx .gctx-icon {{ flex-shrink: 0; }}
         .guild-ctx .gctx-name {{ color: #fff; font-weight: 600; }}
+        .channel-list {{ display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }}
+        .channel-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #111827; border: 1px solid #1e2a3d; border-radius: 8px; padding: 10px 12px; }}
+        .channel-meta {{ display: flex; flex-direction: column; gap: 2px; min-width: 0; }}
+        .channel-name {{ color: #fff; font-weight: 600; font-size: 14px; }}
+        .channel-id {{ color: #64748b; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        a.channel-open {{ flex-shrink: 0; background: #ea4335; color: #fff; text-decoration: none; font-size: 13px; font-weight: 600; padding: 8px 14px; border-radius: 6px; transition: background .15s; }}
+        a.channel-open:hover {{ background: #c5221f; }}
     </style>
 </head>
 <body>
@@ -104,7 +111,7 @@ pub fn render_verify_page(base_url: &str) -> String {
         </div>
         <button id="logout-btn" class="btn-logout hidden" onclick="doLogout()">Logout</button>
     </div>
-    <p class="subtitle">Link your Discord and YouTube accounts to automatically receive server roles based on your YouTube subscriptions.</p>
+    <p class="subtitle">Everything's on this page: subscribe on YouTube, link your Discord + YouTube accounts, and your server roles are assigned automatically.</p>
 
     <!-- Server context banner: only shown when ?guild=<id> is present in the URL.
          Lets a server admin share a per-guild link that both verifies the user
@@ -114,6 +121,18 @@ pub fn render_verify_page(base_url: &str) -> String {
         <span id="guild-ctx-text"></span>
     </div>
 
+    <!-- Step 1: subscribe. Always visible (instructional — a subscription can
+         only be confirmed after the user links YouTube), lists the channel(s)
+         this server's roles check against, each linking straight to YouTube so
+         the admin doesn't have to paste the link separately. -->
+    <div id="subscribe-section" class="card">
+        <h2>Step 1: Subscribe on YouTube</h2>
+        <p>Open the channel below and hit <strong>Subscribe</strong>. Already subscribed? Skip ahead — we detect it once your accounts are linked.</p>
+        <div class="channel-list" id="channel-list">
+            <p style="color:#64748b; font-size:13px;">Loading channel…</p>
+        </div>
+    </div>
+
     <!-- Loading -->
     <div id="loading-section" class="card">
         <p style="color: #64748b;">Loading...</p>
@@ -121,7 +140,7 @@ pub fn render_verify_page(base_url: &str) -> String {
 
     <!-- Login -->
     <div id="login-section" class="card hidden">
-        <h2>Step 1: Sign in with Discord</h2>
+        <h2>Step 2: Sign in with Discord</h2>
         <p>Sign in so we know which Discord account to assign roles to.</p>
         <p class="trust-note">We request the <strong>identify</strong> and <strong>guilds</strong> scopes only.</p>
         <div class="actions">
@@ -135,7 +154,7 @@ pub fn render_verify_page(base_url: &str) -> String {
     <!-- YouTube link step -->
     <div id="youtube-section" class="card hidden">
         <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
-            <h2 style="margin:0;">Step 2: Link YouTube</h2>
+            <h2 style="margin:0;">Step 3: Link YouTube</h2>
             <span class="badge badge-discord" id="yt-discord-badge"></span>
         </div>
         <p>Connect your YouTube account so we can check your subscriptions.</p>
@@ -309,6 +328,46 @@ pub fn render_verify_page(base_url: &str) -> String {
         }}
     }}
 
+    function escHtml(s) {{
+        return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c]);
+    }}
+
+    // Step 1 ("subscribe"): list the YouTube channel(s) this server's roles
+    // check against so the user can subscribe straight from here. Public
+    // endpoint — runs before sign-in. Best-effort; falls back to generic copy.
+    async function loadChannels() {{
+        const list = document.getElementById('channel-list');
+        if (!list) return;
+        try {{
+            const url = API + '/verify/channels' + (guildId ? ('?guild=' + encodeURIComponent(guildId)) : '');
+            const res = await fetch(url, {{ cache: 'no-store' }});
+            const d = await res.json().catch(() => ({{}}));
+            renderChannels((d && d.channels) || []);
+        }} catch (e) {{
+            renderChannels([]);
+        }}
+    }}
+
+    function renderChannels(channels) {{
+        const list = document.getElementById('channel-list');
+        if (!list) return;
+        if (!channels.length) {{
+            list.innerHTML = '<p style="color:#94a3b8; font-size:13px;">' + (guildId
+                ? "This server hasn't set its YouTube channel yet. You can still sign in and link below — your role applies once it does."
+                : "Open the YouTube channel your server uses, hit Subscribe, then continue below.") + '</p>';
+            return;
+        }}
+        list.innerHTML = channels.map(c => {{
+            const id = c.channel_id || '';
+            const href = 'https://www.youtube.com/channel/' + encodeURIComponent(id);
+            return '<div class="channel-row">' +
+                '<span class="channel-meta"><span class="channel-name">YouTube channel</span>' +
+                '<span class="channel-id">' + escHtml(id) + '</span></span>' +
+                '<a class="channel-open" href="' + href + '" target="_blank" rel="noopener">Subscribe &rarr;</a>' +
+            '</div>';
+        }}).join('');
+    }}
+
     async function init() {{
         try {{
             const s = await api('GET', '/verify/status');
@@ -382,6 +441,7 @@ pub fn render_verify_page(base_url: &str) -> String {
         }} catch (e) {{ showMsg(e.message, 'error'); }}
     }}
 
+    loadChannels();
     init();
     </script>
 </body>
@@ -710,6 +770,44 @@ pub async fn status(
         "display_name": display_name,
         "linked": account.is_some(),
     })))
+}
+
+#[derive(Deserialize)]
+pub struct VerifyChannelsQuery {
+    pub guild: Option<String>,
+}
+
+/// Public (no auth): the YouTube channel(s) this guild's roles require a
+/// subscription to, so the verify page can render its "subscribe" step before
+/// the user signs in. Returns only the channel IDs the admin already
+/// advertises ("subscribe to our channel") — nothing sensitive. An invalid or
+/// missing `guild` yields an empty list, so the page falls back to generic copy
+/// without a wasted query.
+pub async fn verify_channels(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<VerifyChannelsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let guild_id = q.guild.unwrap_or_default();
+    let valid =
+        (5..=25).contains(&guild_id.len()) && guild_id.bytes().all(|b| b.is_ascii_digit());
+    if !valid {
+        return Ok(Json(json!({ "channels": [] })));
+    }
+
+    let channel_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT channel_id FROM role_links \
+         WHERE guild_id = $1 AND channel_id IS NOT NULL \
+         ORDER BY channel_id LIMIT 50",
+    )
+    .bind(&guild_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let channels: Vec<Value> = channel_ids
+        .into_iter()
+        .map(|id| json!({ "channel_id": id }))
+        .collect();
+    Ok(Json(json!({ "channels": channels })))
 }
 
 pub async fn logout(jar: CookieJar) -> (CookieJar, Json<Value>) {

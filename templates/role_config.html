@@ -203,12 +203,23 @@ function presets(){ return [
   make:()=>({grant:false,groups:[[c('isSubscribed','eq',true),c('subscriptionAgeDays','gte',state._days||30)]]})},
  {id:"established", t:"Subscribers with an established channel", d:"Subscribed + at least N subscribers of their own.", n:'subs',
   make:()=>({grant:false,groups:[[c('isSubscribed','eq',true),c('subscriberCount','gte',state._subs||100)]]})},
+ {id:"creator", t:"Creators with an audience", d:"At least N subscribers on their own channel. No subscription needed.", n:'csubs',
+  make:()=>({grant:false,groups:[[c('subscriberCount','gte',state._csubs||1000)]]})},
  {id:"anyone_linked", t:"Anyone who linked YouTube", d:"No subscription needed. No channel needed.",
   make:()=>({grant:true,groups:[]})},
  {id:"custom", t:"Advanced rule", d:"Combine several conditions with AND / OR.", make:null},
 ];}
 function c(t,o,v){ return {target:t,operator:o,value:v,value_end:null}; }
-function needsChannel(id){ return id!=='anyone_linked'; }
+// Whether any condition reads the subscription to YOUR channel (vs only the
+// member's own channel stats). Only those rules need a channel ID.
+function ruleUsesSubscription(cfg){
+  if(!cfg||cfg.grant_on_any) return false;
+  return (cfg.groups||[]).some(g=>(g.conditions||[]).some(x=>{
+    const t=targetByKey(x.target); return t&&t.group==='subscription'; })); }
+function needsChannel(id){
+  if(id==='anyone_linked'||id==='creator') return false;
+  if(id==='custom') return ruleUsesSubscription(state._edit);
+  return true; }
 
 async function load(){
   try{
@@ -220,6 +231,7 @@ async function load(){
     state=await r.json();
     state._edit=JSON.parse(JSON.stringify(state.config));
     state._days=guessDays(state._edit); state._subs=guessSubs(state._edit);
+    state._csubs=guessOwnSubs(state._edit);
     state._preset=detectPreset(state._edit);
     // Freshly-registered link: empty groups + grant false grants nobody. Show
     // "Anyone subscribed" pre-selected and align the edit buffer so a single
@@ -243,11 +255,13 @@ function detectPreset(cfg){
     if(cs.length===1&&cs[0].target==='isSubscribed'&&cs[0].operator==='eq'&&cs[0].value===true) return 'anyone_sub';
     if(cs.length===2&&cs[0].target==='isSubscribed'&&cs[1].target==='subscriptionAgeDays'&&cs[1].operator==='gte') return 'loyal';
     if(cs.length===2&&cs[0].target==='isSubscribed'&&cs[1].target==='subscriberCount'&&cs[1].operator==='gte') return 'established';
+    if(cs.length===1&&cs[0].target==='subscriberCount'&&cs[0].operator==='gte') return 'creator';
   }
   return 'custom';
 }
 function guessDays(cfg){ try{ return Number((cfg.groups[0].conditions.find(x=>x.target==='subscriptionAgeDays')||{}).value)||30; }catch(_){ return 30; } }
 function guessSubs(cfg){ try{ return Number((cfg.groups[0].conditions.find(x=>x.target==='subscriberCount')||{}).value)||100; }catch(_){ return 100; } }
+function guessOwnSubs(cfg){ try{ return Number((cfg.groups[0].conditions.find(x=>x.target==='subscriberCount')||{}).value)||1000; }catch(_){ return 1000; } }
 function targetByKey(k){ return state.targets.find(t=>t.key===k); }
 function opByKey(k){ return state.operators.find(o=>o.key===k); }
 function opsForKind(k){ return state.operators.filter(o=>o.valid_for[k]); }
@@ -269,6 +283,8 @@ function render(){
     <input type="number" id="loyaln" min="1" value="${state._days}"> days</div></div>`;
   else if(cur==='established') extra=`<div class="extra"><div class="inline">At least
     <input type="number" id="estn" min="0" value="${state._subs}"> subscribers on their channel</div></div>`;
+  else if(cur==='creator') extra=`<div class="extra"><div class="inline">At least
+    <input type="number" id="creatorn" min="0" value="${state._csubs}"> subscribers on their own channel</div></div>`;
   else if(cur==='custom') extra=`<div class="extra"><div class="adv" id="rule"></div></div>`;
 
   let chanBlk='';
@@ -312,7 +328,7 @@ function render(){
 
   app.innerHTML=`
     <h1>YouTube Subscriber Role</h1>
-    <p class="sub">Give this Discord role automatically, based on a member's YouTube subscription.</p>
+    <p class="sub">Give this Discord role automatically, based on a member's YouTube subscription or their own channel's stats.</p>
     <div class="q">Who should get this role?</div>
     <div class="opts">${opts}</div>
     ${extra}
@@ -342,6 +358,8 @@ function render(){
     state._days=Math.max(1,Number(e.target.value)||1); applyPreset('loyal'); recomputeDirty(); });
   const en=document.getElementById('estn'); if(en) en.addEventListener('input',e=>{
     state._subs=Math.max(0,Number(e.target.value)||0); applyPreset('established'); recomputeDirty(); });
+  const cn=document.getElementById('creatorn'); if(cn) cn.addEventListener('input',e=>{
+    state._csubs=Math.max(0,Number(e.target.value)||0); applyPreset('creator'); recomputeDirty(); });
   document.getElementById('save').addEventListener('click',doSave);
   document.getElementById('preview').addEventListener('click',doPreviewEdit);
   if(cur==='custom') renderRule();
@@ -378,13 +396,16 @@ function renderRule(){
       ${g.conditions.map((cc,ci)=>condRow(cc,gi,ci)).join('')}
       <button data-ac="${gi}" style="margin-top:6px">+ condition</button>
     </div>`).join('')+`<button id="ag" style="margin-top:8px">+ OR group</button>`;
-  box.querySelectorAll('[data-dg]').forEach(b=>b.onclick=()=>{ cfg.groups.splice(+b.dataset.dg,1); recomputeDirty(); renderRule(); postHeight(); });
+  // Structural edits can add/remove subscription conditions, which toggles
+  // whether the channel-ID block is needed — re-render the whole page so it
+  // tracks (value edits below stay on the cheap path).
+  box.querySelectorAll('[data-dg]').forEach(b=>b.onclick=()=>{ cfg.groups.splice(+b.dataset.dg,1); recomputeDirty(); render(); });
   box.querySelectorAll('[data-ac]').forEach(b=>b.onclick=()=>{
     if(cfg.groups[+b.dataset.ac].conditions.length>=state.limits.max_conditions_per_group){ postToast(`Max ${state.limits.max_conditions_per_group} conditions per group.`); return; }
-    cfg.groups[+b.dataset.ac].conditions.push(c('isSubscribed','eq',true)); recomputeDirty(); renderRule(); postHeight(); });
+    cfg.groups[+b.dataset.ac].conditions.push(c('isSubscribed','eq',true)); recomputeDirty(); render(); });
   const ag=document.getElementById('ag'); if(ag) ag.onclick=()=>{
     if(cfg.groups.length>=state.limits.max_groups){ postToast(`Max ${state.limits.max_groups} groups.`); return; }
-    cfg.groups.push({conditions:[c('isSubscribed','eq',true)]}); recomputeDirty(); renderRule(); postHeight(); };
+    cfg.groups.push({conditions:[c('isSubscribed','eq',true)]}); recomputeDirty(); render(); };
   box.querySelectorAll('[data-cond]').forEach(wireCond);
 }
 function condRow(cc,gi,ci){
@@ -411,7 +432,7 @@ function wireCond(row){
   row.querySelector('.t').onchange=e=>{ cc.target=e.target.value; const t=targetByKey(cc.target);
     if(t.kind==='bool'){ cc.operator='eq'; cc.value=true; } else { const v=opsForKind(t.kind);
       if(!v.find(x=>x.key===cc.operator)) cc.operator=v[0].key; cc.value=''; }
-    cc.value_end=null; recomputeDirty(); renderRule(); postHeight(); };
+    cc.value_end=null; recomputeDirty(); render(); };
   const bv=row.querySelector('.bv'); if(bv) bv.onchange=e=>{ cc.operator='eq'; cc.value=e.target.value==='1'; recomputeDirty(); };
   const o=row.querySelector('.o'); if(o) o.onchange=e=>{ cc.operator=e.target.value; cc.value_end=null; recomputeDirty(); renderRule(); postHeight(); };
   row.querySelectorAll('.v,.ve').forEach(inp=>inp.oninput=()=>{ const t=targetByKey(cc.target),op=opByKey(cc.operator)||{};
@@ -422,7 +443,7 @@ function wireCond(row){
   row.querySelector('[data-del]').onclick=()=>{ cfg.groups[gi].conditions.splice(ci,1);
     if(cfg.groups[gi].conditions.length===0) cfg.groups.splice(gi,1);
     if(cfg.groups.length===0) cfg.groups=[{conditions:[c('isSubscribed','eq',true)]}];
-    recomputeDirty(); renderRule(); postHeight(); };
+    recomputeDirty(); render(); };
 }
 
 async function setViewPerm(next){
@@ -484,10 +505,11 @@ async function doPreviewEdit(){
 }
 async function doSave(){
   const cfg=state._edit;
-  // A subscription/stat rule is evaluated against a channel; saving one without
-  // it grants the role to nobody. Reject before the round-trip (same as backend).
-  if(!cfg.grant_on_any && (cfg.groups||[]).length>0 && !(cfg.channel_id||'').trim()){
-    postToast('Enter your YouTube channel ID above before saving — without it the rule matches nobody.');
+  // Subscription conditions are evaluated against a channel; saving without
+  // one grants the role to nobody. Rules using only the member's own channel
+  // stats don't need it. Reject before the round-trip (same as backend).
+  if(!cfg.grant_on_any && ruleUsesSubscription(cfg) && !(cfg.channel_id||'').trim()){
+    postToast('This rule checks subscriptions — enter your YouTube channel ID above before saving.');
     return;
   }
   const payload={ config_version:state.config_version,
@@ -519,6 +541,7 @@ async function refreshFromServer(){
       if(applySup) state.subscribers=d.subscribers;
       if(cfgCh&&!dirty){ state.config=d.config; state._edit=JSON.parse(JSON.stringify(d.config));
         state.config_version=d.config_version; state._days=guessDays(state._edit); state._subs=guessSubs(state._edit);
+        state._csubs=guessOwnSubs(state._edit);
         state._preset=detectPreset(state._edit); if(state._preset==='unconfigured') state._preset='anyone_sub'; }
       if(applySup||(cfgCh&&!dirty)){ render(); autoPreview(); } }
   }catch(_){}

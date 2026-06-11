@@ -51,11 +51,17 @@ impl CachedInterval {
     async fn get(&self, pool: &sqlx::PgPool) -> i64 {
         let mut last = self.last_computed.lock().await;
         if last.elapsed() >= std::time::Duration::from_secs(INTERVAL_CACHE_SECS) {
-            // Count the number of subscription checks needed
-            let check_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_cache")
-                .fetch_one(pool)
-                .await
-                .unwrap_or(0);
+            // Count the number of periodic checks needed: one per subscription
+            // row, plus one per user who only has channel stats to refresh
+            // (stat-only rules in guilds with no configured channel).
+            let check_count: i64 = sqlx::query_scalar(
+                "SELECT (SELECT COUNT(*) FROM subscription_cache) + \
+                 (SELECT COUNT(*) FROM channel_cache cc WHERE NOT EXISTS \
+                    (SELECT 1 FROM subscription_cache sc WHERE sc.discord_id = cc.discord_id))",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
 
             // Check if any role_link conditions need channel stats
             let needs_cs = self.check_needs_channel_stats(pool).await;
@@ -126,7 +132,13 @@ pub async fn run(state: Arc<AppState>) {
         let (discord_id, channel_id, mut access_token, refresh_token, token_expires_at, is_active, linked_at) = match next {
             Ok(Some(row)) => row,
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                // No subscription check pending. Stat-only rules (e.g. "their
+                // own subscriber count") live in guilds with no configured
+                // channel, so those users never appear in subscription_cache —
+                // refresh their channel stats here or they'd go stale forever.
+                if !refresh_channel_stats_only(&state, &cached_interval).await {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
                 continue;
             }
             Err(e) => {
@@ -377,4 +389,176 @@ pub async fn run(state: Arc<AppState>) {
             }
         }
     }
+}
+
+/// Refresh channel stats for one due `channel_cache` row. Covers users with no
+/// `subscription_cache` rows (stat-only rules in channel-less guilds), who the
+/// main loop's subscription-driven path never reaches; users who do have
+/// subscription rows are merely refreshed a little earlier than their next
+/// subscription check would have. The caller has already taken a rate-limiter
+/// permit, which covers the single channels.list call made here.
+///
+/// Returns false when nothing was due (caller sleeps), true otherwise.
+async fn refresh_channel_stats_only(state: &Arc<AppState>, cached_interval: &CachedInterval) -> bool {
+    let next = sqlx::query_as::<_, (String, String, String, chrono::DateTime<chrono::Utc>, bool)>(
+        "SELECT cc.discord_id, la.google_access_token, la.google_refresh_token, \
+         la.google_token_expires_at, \
+         EXISTS(SELECT 1 FROM role_assignments ra WHERE ra.discord_id = cc.discord_id) as is_active \
+         FROM channel_cache cc \
+         JOIN linked_accounts la ON la.discord_id = cc.discord_id \
+         WHERE cc.next_check_at <= now() \
+         ORDER BY is_active DESC, cc.check_failures ASC, cc.next_check_at ASC \
+         LIMIT 1",
+    )
+    .fetch_optional(&state.pool)
+    .await;
+
+    let (discord_id, mut access_token, refresh_token, token_expires_at, is_active) = match next {
+        Ok(Some(row)) => row,
+        Ok(None) => return false,
+        Err(e) => {
+            tracing::error!("Channel stats refresh DB error: {e}");
+            return false;
+        }
+    };
+
+    // Refresh Google access token if expired
+    if token_expires_at <= chrono::Utc::now() {
+        match state.youtube_client.refresh_google_token(&state.config, &refresh_token).await {
+            Ok(tokens) => {
+                access_token = tokens.access_token.clone();
+                let new_expires = chrono::Utc::now() + chrono::Duration::seconds(tokens.expires_in);
+                let new_refresh = tokens.refresh_token.as_deref().unwrap_or(&refresh_token);
+                if let Err(e) = sqlx::query(
+                    "UPDATE linked_accounts SET google_access_token = $1, google_refresh_token = $2, \
+                     google_token_expires_at = $3 WHERE discord_id = $4",
+                )
+                .bind(&tokens.access_token)
+                .bind(new_refresh)
+                .bind(new_expires)
+                .bind(&discord_id)
+                .execute(&state.pool)
+                .await
+                {
+                    tracing::error!(discord_id, "Failed to update Google tokens: {e}");
+                    return true;
+                }
+            }
+            Err(YouTubeError::TokenRevoked) => {
+                tracing::warn!(discord_id, "Google token revoked, backing off channel stats");
+                let backoff = chrono::Utc::now() + chrono::Duration::hours(24);
+                let _ = sqlx::query(
+                    "UPDATE channel_cache SET next_check_at = $1, check_failures = check_failures + 1 \
+                     WHERE discord_id = $2",
+                )
+                .bind(backoff)
+                .bind(&discord_id)
+                .execute(&state.pool)
+                .await;
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(discord_id, "Google token refresh failed: {e}");
+                let _ = sqlx::query(
+                    "UPDATE channel_cache SET check_failures = check_failures + 1, \
+                     next_check_at = now() + LEAST(INTERVAL '60 seconds' * POWER(2, check_failures), INTERVAL '1 hour') \
+                     WHERE discord_id = $1",
+                )
+                .bind(&discord_id)
+                .execute(&state.pool)
+                .await;
+                return true;
+            }
+        }
+    }
+
+    tracing::debug!(discord_id, is_active, "Refreshing channel stats (no subscription check due)");
+
+    match state.youtube_client.fetch_channel_stats(&access_token).await {
+        Ok(stats) => {
+            let base_interval = cached_interval.get(&state.pool).await;
+            let multiplier = if is_active { 1 } else { INACTIVE_MULTIPLIER };
+            let cc_interval = base_interval * multiplier * CHANNEL_STATS_MULTIPLIER;
+            let cc_next = chrono::Utc::now() + chrono::Duration::seconds(cc_interval);
+
+            if let Err(e) = sqlx::query(
+                "UPDATE channel_cache SET \
+                 subscriber_count = $1, view_count = $2, video_count = $3, \
+                 channel_created_at = $4, hidden_subscribers = $5, country = $6, custom_url = $7, \
+                 checked_at = now(), next_check_at = $8, check_failures = 0 \
+                 WHERE discord_id = $9",
+            )
+            .bind(stats.subscriber_count)
+            .bind(stats.view_count)
+            .bind(stats.video_count)
+            .bind(stats.channel_created_at)
+            .bind(stats.hidden_subscriber_count)
+            .bind(&stats.country)
+            .bind(&stats.custom_url)
+            .bind(cc_next)
+            .bind(&discord_id)
+            .execute(&state.pool)
+            .await
+            {
+                tracing::error!(discord_id, "Failed to update channel cache: {e}");
+                return true;
+            }
+
+            let _ = state
+                .player_sync_tx
+                .send(PlayerSyncEvent::PlayerUpdated {
+                    discord_id: discord_id.clone(),
+                })
+                .await;
+
+            tracing::debug!(
+                discord_id,
+                subscribers = stats.subscriber_count,
+                views = stats.view_count,
+                videos = stats.video_count,
+                "Channel stats updated"
+            );
+        }
+        Err(YouTubeError::QuotaExceeded) => {
+            tracing::warn!("YouTube API quota exceeded, backing off channel stats checks");
+            let backoff = chrono::Utc::now() + chrono::Duration::hours(1);
+            let _ = sqlx::query(
+                "UPDATE channel_cache SET next_check_at = $1 WHERE next_check_at <= now()",
+            )
+            .bind(backoff)
+            .execute(&state.pool)
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
+        Err(YouTubeError::TokenExpired | YouTubeError::TokenRevoked) => {
+            tracing::warn!(discord_id, "YouTube token invalid, backing off channel stats");
+            let backoff = chrono::Utc::now() + chrono::Duration::hours(24);
+            let _ = sqlx::query(
+                "UPDATE channel_cache SET next_check_at = $1, check_failures = check_failures + 1 \
+                 WHERE discord_id = $2",
+            )
+            .bind(backoff)
+            .bind(&discord_id)
+            .execute(&state.pool)
+            .await;
+        }
+        Err(e) => {
+            let failures = sqlx::query_scalar::<_, i32>(
+                "UPDATE channel_cache SET check_failures = check_failures + 1, \
+                 next_check_at = now() + LEAST(INTERVAL '60 seconds' * POWER(2, check_failures), INTERVAL '6 hours') \
+                 WHERE discord_id = $1 \
+                 RETURNING check_failures",
+            )
+            .bind(&discord_id)
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+
+            tracing::warn!(discord_id, failures, "Channel stats fetch failed: {e}");
+        }
+    }
+
+    true
 }

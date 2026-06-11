@@ -409,16 +409,17 @@ pub async fn role_config_save(
     let expected_version = body.config_version;
     let parsed = rule_validator::parse_rule_tree(body.tree)?;
 
-    // A subscription/stat rule (anything that isn't "anyone who linked") is
-    // evaluated against a configured channel; without one the subscription
-    // condition can never be true, so require it. Mirrors the preview's
-    // "nobody" guard so the two never disagree.
+    // Subscription conditions are evaluated against a configured channel;
+    // without one they can never be true, so require it. Rules built only from
+    // the member's own channel stats (subscriber count etc.) are channel-
+    // agnostic and save fine without one. Mirrors the preview's "nobody"
+    // guard so the two never disagree.
     if !parsed.rule_tree.grant_on_any
-        && !parsed.rule_tree.groups.is_empty()
+        && rule_needs_channel(&parsed.rule_tree)
         && parsed.channel_id.is_none()
     {
         return Err(AppError::BadRequest(
-            "Enter the YouTube channel ID this rule checks against before saving.".into(),
+            "This rule checks subscriptions to your channel — enter the YouTube channel ID it should check against before saving.".into(),
         ));
     }
 

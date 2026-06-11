@@ -196,6 +196,17 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_count_rule_grants_without_subscription() {
+        // Stat-only rule: the member's own audience size qualifies them even
+        // when they never subscribed to the configured channel.
+        let t = tree(vec![vec![cond(T::SubscriberCount, Op::Gte, json!(100))]]);
+        assert!(evaluate_rule_tree(&t, &facts(false)));
+        // ...but still fails closed below the threshold.
+        let t = tree(vec![vec![cond(T::SubscriberCount, Op::Gte, json!(501))]]);
+        assert!(!evaluate_rule_tree(&t, &facts(false)));
+    }
+
+    #[test]
     fn hidden_subscribers_fails_count_condition() {
         let mut f = facts(true);
         f.hidden_subscribers = true;

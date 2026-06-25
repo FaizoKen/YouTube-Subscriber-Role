@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::AppError;
+use crate::services::quota::{Class, Outcome};
 use crate::services::session;
 use crate::services::sync::{self, PlayerSyncEvent};
 use crate::services::youtube::YouTubeClient;
@@ -610,7 +611,23 @@ pub async fn youtube_callback(
         .unwrap_or_default();
 
         for channel_id in &channel_ids {
-            state.youtube_client.wait_for_permit().await;
+            // The user is actively watching this page, so spend from the
+            // interactive quota reserve (which background re-checks can't touch).
+            // If even that is exhausted, skip the inline call and seed the row so
+            // the worker confirms it shortly — the role still lands, just not
+            // before the page reloads.
+            if let Outcome::Exhausted { .. } = state.quota.acquire(Class::Interactive).await {
+                let _ = sqlx::query(
+                    "INSERT INTO subscription_cache (discord_id, channel_id, next_check_at) \
+                     VALUES ($1, $2, now()) \
+                     ON CONFLICT (discord_id, channel_id) DO UPDATE SET next_check_at = now()",
+                )
+                .bind(&discord_id)
+                .bind(channel_id)
+                .execute(&state.pool)
+                .await;
+                continue;
+            }
             match state
                 .youtube_client
                 .check_subscription(&tokens.access_token, channel_id)
@@ -669,13 +686,25 @@ pub async fn youtube_callback(
     // role sync below evaluates correctly); otherwise seed a deferred row so the
     // subscribers page fills in later without spending quota during the spike.
     if needs_channel_stats {
-        state.youtube_client.wait_for_permit().await;
-        match state
-            .youtube_client
-            .fetch_channel_stats(&tokens.access_token)
-            .await
-        {
-            Ok(stats) => {
+        let granted =
+            matches!(state.quota.acquire(Class::Interactive).await, Outcome::Granted);
+        match (granted, if granted {
+            Some(state.youtube_client.fetch_channel_stats(&tokens.access_token).await)
+        } else {
+            None
+        }) {
+            (true, Some(Ok(stats))) => {
+                // Capture the user's own channel id so the worker can refresh
+                // their stats via the batched (50:1) path from now on.
+                if let Some(ref cid) = stats.channel_id {
+                    let _ = sqlx::query(
+                        "UPDATE linked_accounts SET youtube_channel_id = $1 WHERE discord_id = $2",
+                    )
+                    .bind(cid)
+                    .bind(&discord_id)
+                    .execute(&state.pool)
+                    .await;
+                }
                 let cc_next =
                     chrono::Utc::now() + chrono::Duration::seconds(INITIAL_RECHECK_SECS * 2);
                 let _ = sqlx::query(
@@ -700,8 +729,12 @@ pub async fn youtube_callback(
                 .execute(&state.pool)
                 .await;
             }
-            Err(e) => {
-                tracing::warn!(discord_id, "Inline channel stats fetch failed; deferring: {e}");
+            (_, maybe_err) => {
+                if let Some(Err(e)) = maybe_err {
+                    tracing::warn!(discord_id, "Inline channel stats fetch failed; deferring: {e}");
+                }
+                // Either the fetch failed or interactive budget was exhausted —
+                // seed a due row for the worker to fill in.
                 let _ = sqlx::query(
                     "INSERT INTO channel_cache (discord_id, next_check_at) VALUES ($1, now()) \
                      ON CONFLICT (discord_id) DO NOTHING",

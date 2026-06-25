@@ -16,6 +16,7 @@ mod schema;
 mod services;
 mod tasks;
 
+use services::quota::QuotaGovernor;
 use services::rolelogic::RoleLogicClient;
 use services::sync::{ConfigSyncEvent, PlayerSyncEvent};
 use services::youtube::YouTubeClient;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub player_sync_tx: mpsc::Sender<PlayerSyncEvent>,
     pub config_sync_tx: mpsc::Sender<ConfigSyncEvent>,
     pub youtube_client: YouTubeClient,
+    /// Central daily-quota budget + pacing for every YouTube Data API call.
+    pub quota: Arc<QuotaGovernor>,
     pub rl_client: RoleLogicClient,
     pub http: reqwest::Client,
     pub verify_html: bytes::Bytes,
@@ -50,7 +53,19 @@ async fn main() {
     db::run_migrations(&pool).await;
     tracing::info!("Database connected and migrations applied");
 
-    let (player_sync_tx, player_sync_rx) = mpsc::channel::<PlayerSyncEvent>(512);
+    let refresh_workers = app_config.refresh_workers;
+
+    // Central quota governor — loads today's spend from the durable ledger so a
+    // restart resumes accounting instead of resetting to zero and over-spending.
+    let quota = QuotaGovernor::new(
+        pool.clone(),
+        app_config.youtube_quota_per_day,
+        app_config.quota_interactive_reserve,
+        app_config.quota_safety_fraction,
+    )
+    .await;
+
+    let (player_sync_tx, player_sync_rx) = mpsc::channel::<PlayerSyncEvent>(2048);
     let (config_sync_tx, config_sync_rx) = mpsc::channel::<ConfigSyncEvent>(64);
 
     let youtube_client = YouTubeClient::new();
@@ -68,14 +83,25 @@ async fn main() {
         player_sync_tx,
         config_sync_tx,
         youtube_client,
+        quota: Arc::clone(&quota),
         rl_client,
         http,
         verify_html,
         subscribers_html,
     });
 
-    // Spawn background workers
-    tokio::spawn(tasks::refresh_worker::run(Arc::clone(&state)));
+    // Persist the quota ledger on an interval.
+    tokio::spawn(Arc::clone(&quota).run_flusher());
+
+    // Spawn background refresh workers, partitioned by hashtext(discord_id) % N
+    // so they never double-process. They share the one quota governor's budget.
+    for worker_id in 0..refresh_workers {
+        tokio::spawn(tasks::refresh_worker::run(
+            Arc::clone(&state),
+            worker_id,
+            refresh_workers,
+        ));
+    }
     tokio::spawn(tasks::player_sync_worker::run(player_sync_rx, Arc::clone(&state)));
     tokio::spawn(tasks::config_sync_worker::run(config_sync_rx, Arc::clone(&state)));
     tokio::spawn(tasks::cleanup_expired(Arc::clone(&state)));

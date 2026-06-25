@@ -2,6 +2,8 @@ pub mod auth;
 pub mod auth_gateway;
 pub mod condition_eval;
 pub mod csrf;
+pub mod pacific;
+pub mod quota;
 pub mod rl_token;
 pub mod rolelogic;
 pub mod rule_sql;

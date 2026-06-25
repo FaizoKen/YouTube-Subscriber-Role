@@ -108,17 +108,28 @@ Embedded by the dashboard; also reachable directly (cookie + Manage Server).
 | ------ | --------- | ------------ |
 | `GET`  | `/health` | Health check |
 
-## Refresh Timing
+## Refresh Timing & Quota Governor
 
-The **first** check happens inline the moment a member links their account, so they receive the role within seconds regardless of how many others are verifying at the same time. After that, the plugin re-checks subscription status periodically, scaled by user count and YouTube API quota (default 10,000 units/day):
+The YouTube Data API bills quota **per Google Cloud project** (default 10,000 units/day, reset at midnight Pacific), and a subscription check costs **1 unit per user with no batch API**. That project ceiling — not CPU or DB — is the hard limit on how many users can be kept fresh. Everything below is about spending each unit where it matters and never falling over when it runs out.
 
-| Users | Active Check Interval | Inactive Check Interval |
-| ----- | --------------------- | ----------------------- |
-| 1-5   | 30 min                | 3 hours                 |
-| 100   | ~14 min               | ~1.4 hours              |
-| 1,000 | ~2.4 hours            | ~14.4 hours             |
+**The first check is inline.** The moment a member links, their subscription is checked using the freshly-issued token and the role is granted before the page reloads — independent of how many others verify at the same time.
 
-Active users (those with an assigned role) are checked **6x more frequently**.
+**A central quota governor** ([`src/services/quota.rs`](src/services/quota.rs)) is the single gate every API call passes through. It:
+
+- Tracks units spent in the current Pacific quota-day, **persisted to the DB** so a restart resumes accounting instead of over-spending.
+- Splits the budget into an **interactive reserve** (link-time checks a user is waiting on — default 20%) and a **background** pool. Background re-checks can never touch the reserve, so a verify spike (e.g. an `@everyone` ping) never starves real-time verification.
+- **Paces** background spend smoothly across the whole day (`spacing = time_to_reset / remaining_budget`) instead of bursting — so there is no thundering herd, and quota-day rollover doesn't release a synchronized flood.
+- Stops *itself* before YouTube has to; a real `quotaExceeded` is a hard stop until the true Pacific reset, with the one affected row requeued past it with jitter.
+
+**Adaptive cadence.** Subscriptions are stable, so a row whose status hasn't changed earns an exponentially longer interval (up to ~16×, capped at 24h), while a row that just flipped is re-checked promptly. Active users (with an assigned role) are still checked more often than inactive ones. This concentrates scarce quota on churn — the biggest multiplier on effective capacity.
+
+**Batched stats.** Own-channel statistics (for stat-based rules and the subscribers list) are refreshed **50 at a time** via the public `channels.list?id=` API-key path (1 unit per 50 users), once a user's channel id is known. Set `YOUTUBE_API_KEY` to enable this; without it, stats fall back to 1 unit per user.
+
+**Graceful degradation.** When the budget is spent, roles keep being served from cache; `is_subscribed` is only ever written from a definite API answer, so a role is **never** stripped because a check couldn't run.
+
+**Scaling.** Rows are claimed with `FOR UPDATE SKIP LOCKED` and partitioned by `hashtext(discord_id) % N`, so `REFRESH_WORKERS` can be raised (and, with care, multiple instances run) without double-processing. To genuinely serve millions, raise the project quota (`YOUTUBE_QUOTA_PER_DAY`) via a Google quota increase and/or add API keys from additional projects — the governor treats the quota as a configurable, multipliable budget.
+
+See [`.env.example`](.env.example) for `QUOTA_INTERACTIVE_RESERVE`, `QUOTA_SAFETY_FRACTION`, and `REFRESH_WORKERS`.
 
 ## License
 

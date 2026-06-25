@@ -9,6 +9,22 @@ pub struct AppConfig {
     pub base_url: String,
     pub listen_addr: String,
     pub youtube_quota_per_day: i64,
+    /// Public YouTube Data API key(s) for batched, OAuth-free `channels.list?id=`
+    /// statistics lookups (50 channels / 1 unit). Empty disables batching and
+    /// falls back to the per-user `mine=true` path. Multiple keys (comma-
+    /// separated) are round-robined — only a quota multiplier if they belong to
+    /// *different* Cloud projects; keys in one project share that project's quota.
+    pub youtube_api_keys: Vec<String>,
+    /// Fraction of the daily quota reserved for interactive (link-time) checks a
+    /// user is actively waiting on. Background re-checks can't touch it, so a
+    /// verify spike never starves real-time verification. Default 0.20.
+    pub quota_interactive_reserve: f64,
+    /// Fraction of the nominal quota the governor will actually spend, leaving
+    /// headroom for accounting skew / external project usage. Default 0.95.
+    pub quota_safety_fraction: f64,
+    /// Number of background refresh workers to run. They share the governor's
+    /// budget and partition rows by `hashtext(discord_id) % N`. Default 1.
+    pub refresh_workers: i64,
     /// Base URL of the Auth Gateway (no trailing slash, no `/auth` suffix).
     /// Prod: usually the same origin as `BASE_URL` (derived if unset).
     /// Local dev: set to the gateway's local listener, e.g. http://localhost:8090
@@ -74,6 +90,28 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10000),
+            youtube_api_keys: env::var("YOUTUBE_API_KEY")
+                .or_else(|_| env::var("YOUTUBE_API_KEYS"))
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            quota_interactive_reserve: env::var("QUOTA_INTERACTIVE_RESERVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.20),
+            quota_safety_fraction: env::var("QUOTA_SAFETY_FRACTION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.95),
+            refresh_workers: env::var("REFRESH_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|n| n.clamp(1, 64))
+                .unwrap_or(1),
             auth_gateway_url,
             internal_api_key: env::var("INTERNAL_API_KEY")
                 .expect("INTERNAL_API_KEY must be set (must match the Auth Gateway's value)"),

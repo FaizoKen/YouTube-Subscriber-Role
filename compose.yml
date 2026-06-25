@@ -11,6 +11,11 @@ services:
       BASE_URL: ${BASE_URL}
       LISTEN_ADDR: "0.0.0.0:8080"
       YOUTUBE_QUOTA_PER_DAY: ${YOUTUBE_QUOTA_PER_DAY:-10000}
+      # Optional public API key → batched channel-stats (50/unit); empty = per-user fallback.
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      QUOTA_INTERACTIVE_RESERVE: ${QUOTA_INTERACTIVE_RESERVE:-0.20}
+      QUOTA_SAFETY_FRACTION: ${QUOTA_SAFETY_FRACTION:-0.95}
+      REFRESH_WORKERS: ${REFRESH_WORKERS:-1}
       AUTH_GATEWAY_URL: ${AUTH_GATEWAY_URL}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY}
     depends_on:

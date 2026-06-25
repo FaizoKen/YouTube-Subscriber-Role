@@ -1,15 +1,14 @@
-use std::num::NonZeroU32;
-use std::sync::Arc;
-
-use governor::{Quota, RateLimiter};
+use std::collections::HashMap;
 
 use crate::config::AppConfig;
 use crate::error::YouTubeError;
 
+/// Max channel ids per `channels.list` call (YouTube hard limit, still 1 unit).
+pub const CHANNEL_BATCH_MAX: usize = 50;
+
 #[derive(Clone)]
 pub struct YouTubeClient {
     http: reqwest::Client,
-    rate_limiter: Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
 }
 
 /// Tokens returned from Google OAuth token exchange or refresh.
@@ -34,6 +33,10 @@ pub struct ChannelStats {
     pub hidden_subscriber_count: bool,
     pub country: Option<String>,
     pub custom_url: Option<String>,
+    /// The channel's own id. Captured so later refreshes can use the batched,
+    /// API-key `channels.list?id=` path (50 channels / 1 unit) instead of a
+    /// per-user `mine=true` OAuth call.
+    pub channel_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -66,8 +69,45 @@ struct ChannelListResponse {
 
 #[derive(serde::Deserialize)]
 struct ChannelItem {
+    id: Option<String>,
     snippet: Option<ChannelSnippet>,
     statistics: Option<ChannelStatistics>,
+}
+
+impl ChannelItem {
+    /// Project a parsed API item into our `ChannelStats`. Shared by the
+    /// per-user (`mine=true`) and batched (`id=`) fetch paths so they never
+    /// diverge.
+    fn into_stats(self) -> ChannelStats {
+        let stats = self.statistics;
+        let snippet = self.snippet;
+        ChannelStats {
+            subscriber_count: stats
+                .as_ref()
+                .and_then(|s| s.subscriber_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            view_count: stats
+                .as_ref()
+                .and_then(|s| s.view_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            video_count: stats
+                .as_ref()
+                .and_then(|s| s.video_count.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            channel_created_at: snippet
+                .as_ref()
+                .and_then(|s| s.published_at.as_deref())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            hidden_subscriber_count: stats.as_ref().and_then(|s| s.hidden_subscriber_count).unwrap_or(false),
+            country: snippet.as_ref().and_then(|s| s.country.clone()),
+            custom_url: snippet.as_ref().and_then(|s| s.custom_url.clone()),
+            channel_id: self.id,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -95,19 +135,39 @@ impl YouTubeClient {
             .build()
             .expect("Failed to build HTTP client");
 
-        // Short-term burst cap. The real ceiling is the daily quota (spread via
-        // per-row next_check_at scheduling); this just keeps us polite to the API
-        // while letting a verify spike — where many users link at once and each
-        // triggers an inline subscription check — drain in seconds instead of
-        // serializing at a couple per second.
-        let quota = Quota::per_second(NonZeroU32::new(10).unwrap());
-        let rate_limiter = Arc::new(RateLimiter::direct(quota));
-
-        Self { http, rate_limiter }
+        // Daily-budget pacing and the short-term burst cap now live in the
+        // QuotaGovernor (services/quota.rs), which every quota-costing call
+        // passes through. The client just speaks HTTP.
+        Self { http }
     }
 
-    pub async fn wait_for_permit(&self) {
-        self.rate_limiter.until_ready().await;
+    /// Send a GET with a couple of jittered retries on transport-level
+    /// failures (connect/timeout). HTTP error *statuses* are returned to the
+    /// caller untouched — quota/auth handling depends on them. GETs carry no
+    /// body, so `try_clone` always succeeds.
+    async fn send_with_retry(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut attempt: u32 = 0;
+        loop {
+            let this = req
+                .try_clone()
+                .expect("GET requests have no body and are always cloneable");
+            match this.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 3 || !(e.is_timeout() || e.is_connect()) {
+                        return Err(e);
+                    }
+                    // 100–400ms × attempt, jittered, to ride out a blip without
+                    // synchronizing retries across concurrent callers.
+                    let jitter = 100 + (rand::random::<u64>() % 300);
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter * attempt as u64)).await;
+                }
+            }
+        }
     }
 
     /// Check if a user is subscribed to a specific YouTube channel.
@@ -117,7 +177,7 @@ impl YouTubeClient {
         access_token: &str,
         channel_id: &str,
     ) -> Result<SubscriptionResult, YouTubeError> {
-        let resp = self
+        let req = self
             .http
             .get("https://www.googleapis.com/youtube/v3/subscriptions")
             .query(&[
@@ -125,9 +185,8 @@ impl YouTubeClient {
                 ("mine", "true"),
                 ("forChannelId", channel_id),
             ])
-            .header("Authorization", format!("Bearer {access_token}"))
-            .send()
-            .await?;
+            .header("Authorization", format!("Bearer {access_token}"));
+        let resp = self.send_with_retry(req).await?;
 
         let status = resp.status();
 
@@ -188,16 +247,15 @@ impl YouTubeClient {
         &self,
         access_token: &str,
     ) -> Result<ChannelStats, YouTubeError> {
-        let resp = self
+        let req = self
             .http
             .get("https://www.googleapis.com/youtube/v3/channels")
             .query(&[
                 ("part", "statistics,snippet"),
                 ("mine", "true"),
             ])
-            .header("Authorization", format!("Bearer {access_token}"))
-            .send()
-            .await?;
+            .header("Authorization", format!("Bearer {access_token}"));
+        let resp = self.send_with_retry(req).await?;
 
         let status = resp.status();
 
@@ -244,35 +302,68 @@ impl YouTubeClient {
                 hidden_subscriber_count: false,
                 country: None,
                 custom_url: None,
+                channel_id: None,
             });
         };
 
-        let stats = item.statistics.as_ref();
-        let snippet = item.snippet.as_ref();
+        Ok(item.into_stats())
+    }
 
-        Ok(ChannelStats {
-            subscriber_count: stats
-                .and_then(|s| s.subscriber_count.as_deref())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            view_count: stats
-                .and_then(|s| s.view_count.as_deref())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            video_count: stats
-                .and_then(|s| s.video_count.as_deref())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0),
-            channel_created_at: snippet
-                .and_then(|s| s.published_at.as_deref())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc)),
-            hidden_subscriber_count: stats
-                .and_then(|s| s.hidden_subscriber_count)
-                .unwrap_or(false),
-            country: snippet.and_then(|s| s.country.clone()),
-            custom_url: snippet.and_then(|s| s.custom_url.clone()),
-        })
+    /// Fetch statistics for up to [`CHANNEL_BATCH_MAX`] channels in a single
+    /// call (still **1 quota unit**) using a public **API key** — channel stats
+    /// are public, so no per-user OAuth token is involved. This is the 50×
+    /// quota multiplier for stat-based rules versus per-user `mine=true` calls,
+    /// and it sidesteps token-refresh churn entirely.
+    ///
+    /// Returns a map keyed by channel id. Ids YouTube omits from the response
+    /// (deleted / terminated channels) are simply absent from the map; the
+    /// caller decides how to age those rows.
+    pub async fn batch_channel_stats(
+        &self,
+        api_key: &str,
+        channel_ids: &[String],
+    ) -> Result<HashMap<String, ChannelStats>, YouTubeError> {
+        if channel_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids = channel_ids.join(",");
+        let req = self
+            .http
+            .get("https://www.googleapis.com/youtube/v3/channels")
+            .query(&[
+                ("part", "statistics,snippet"),
+                ("id", ids.as_str()),
+                ("maxResults", "50"),
+                ("key", api_key),
+            ]);
+        let resp = self.send_with_retry(req).await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("quotaExceeded") {
+                return Err(YouTubeError::QuotaExceeded);
+            }
+            return Err(YouTubeError::ApiError(format!("403: {body}")));
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(YouTubeError::ApiError(format!("{status}: {body}")));
+        }
+
+        let body: ChannelListResponse = resp
+            .json()
+            .await
+            .map_err(|e| YouTubeError::ApiError(format!("Failed to parse batch channels response: {e}")))?;
+
+        let mut out = HashMap::with_capacity(channel_ids.len());
+        for item in body.items.unwrap_or_default() {
+            let stats = item.into_stats();
+            if let Some(id) = stats.channel_id.clone() {
+                out.insert(id, stats);
+            }
+        }
+        Ok(out)
     }
 
     /// Exchange a Google OAuth authorization code for tokens.

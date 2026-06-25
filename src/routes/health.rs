@@ -49,10 +49,13 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     );
 
     let ((db_ok, db_latency), svc_check) = tokio::join!(db_fut, svc_fut);
+    let q = state.quota.snapshot().await;
 
     let svc_down = svc_check["status"] == "down";
+    // Quota exhaustion isn't an outage — we keep serving roles from cache — but
+    // it does mean fresh checks are paused, so report it as degraded.
     let status = match (db_ok, svc_down) {
-        (true, false) => "healthy",
+        (true, false) if !q.exhausted => "healthy",
         (false, true) => "unhealthy",
         _ => "degraded",
     };
@@ -64,6 +67,13 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
             "database": {
                 "status": if db_ok { "up" } else { "down" },
                 "latency_ms": db_latency
+            },
+            "youtube_quota": {
+                "status": if q.exhausted { "down" } else { "up" },
+                "used_units": q.used,
+                "total_budget": q.total_budget,
+                "remaining_units": q.remaining(),
+                "reset_in_secs": q.reset_in_secs
             }
         },
         "services": [svc_check]

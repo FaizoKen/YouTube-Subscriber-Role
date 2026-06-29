@@ -128,7 +128,12 @@ impl QuotaSnapshot {
 impl QuotaGovernor {
     /// Build the governor, loading today's already-spent units from the durable
     /// ledger so a restart resumes accounting instead of resetting to zero.
-    pub async fn new(pool: PgPool, quota_per_day: i64, reserve_frac: f64, safety_frac: f64) -> Arc<Self> {
+    pub async fn new(
+        pool: PgPool,
+        quota_per_day: i64,
+        reserve_frac: f64,
+        safety_frac: f64,
+    ) -> Arc<Self> {
         let safety = safety_frac.clamp(0.5, 1.0);
         let reserve = reserve_frac.clamp(0.0, 0.9);
         let total_budget = ((quota_per_day as f64) * safety).floor().max(1.0) as i64;
@@ -150,8 +155,8 @@ impl QuotaGovernor {
         // it only clips genuine spikes (a verify storm draining the reserve) and
         // never becomes the throughput ceiling when the quota is raised for
         // large deployments. Floored at BURST_PER_SEC for small quotas.
-        let burst_rate = (((total_budget * 4) / 86_400).max(BURST_PER_SEC as i64))
-            .min(100_000) as u32;
+        let burst_rate =
+            (((total_budget * 4) / 86_400).max(BURST_PER_SEC as i64)).min(100_000) as u32;
         let burst_quota =
             governor::Quota::per_second(std::num::NonZeroU32::new(burst_rate.max(1)).unwrap());
         let burst = governor::RateLimiter::direct(burst_quota);
@@ -242,7 +247,11 @@ impl QuotaGovernor {
                     let remaining = (self.background_budget - g.used).max(1);
                     let secs_to_reset = (self.next_reset(now) - now).num_seconds().max(1);
                     let spacing = ((secs_to_reset * 1000) / remaining).clamp(0, MAX_SPACING_MS);
-                    let base = if g.bg_next_at > now { g.bg_next_at } else { now };
+                    let base = if g.bg_next_at > now {
+                        g.bg_next_at
+                    } else {
+                        now
+                    };
                     let w = (base - now).num_milliseconds().max(0);
                     g.bg_next_at = base + Duration::milliseconds(spacing);
                     w

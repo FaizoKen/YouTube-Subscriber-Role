@@ -342,10 +342,16 @@ async fn require_role_config_access(
                 "Token does not grant access to this role link.".into(),
             ));
         }
-        return Ok(RoleConfigAccess { discord_id: s.discord_id, read_only: s.read_only });
+        return Ok(RoleConfigAccess {
+            discord_id: s.discord_id,
+            read_only: s.read_only,
+        });
     }
     let discord_id = require_manager(state, jar, guild_id).await?;
-    Ok(RoleConfigAccess { discord_id, read_only: false })
+    Ok(RoleConfigAccess {
+        discord_id,
+        read_only: false,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -627,11 +633,12 @@ async fn preview_count_for(
         ));
     }
 
-    let linked: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM linked_accounts WHERE discord_id = ANY($1::text[])")
-            .bind(&member_ids)
-            .fetch_one(&state.pool)
-            .await?;
+    let linked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM linked_accounts WHERE discord_id = ANY($1::text[])",
+    )
+    .bind(&member_ids)
+    .fetch_one(&state.pool)
+    .await?;
 
     // Channel-agnostic "anyone who linked" rule: every linked member qualifies.
     if tree.grant_on_any {

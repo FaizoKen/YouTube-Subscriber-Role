@@ -235,10 +235,16 @@ fn normalize_value(
             let s = match raw {
                 Value::String(s) => s,
                 Value::Number(num) => num.to_string(),
-                _ => return Err(AppError::BadRequest(format!("{where_}: a value is required."))),
+                _ => {
+                    return Err(AppError::BadRequest(format!(
+                        "{where_}: a value is required."
+                    )))
+                }
             };
             if s.trim().is_empty() {
-                return Err(AppError::BadRequest(format!("{where_}: a value is required.")));
+                return Err(AppError::BadRequest(format!(
+                    "{where_}: a value is required."
+                )));
             }
             if target == ConditionTarget::Country {
                 check_country(where_, &s)?;
@@ -299,7 +305,10 @@ mod tests {
             grant_on_any: false,
             groups: vec![],
         };
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -315,13 +324,19 @@ mod tests {
     #[test]
     fn rejects_unknown_target() {
         let body = one_group(vec![input("not_a_target", "eq", json!(true))]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn rejects_operator_target_mismatch() {
         let body = one_group(vec![input("isSubscribed", "gt", json!(0))]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -334,13 +349,19 @@ mod tests {
     #[test]
     fn rejects_negative_int() {
         let body = one_group(vec![input("subscriberCount", "gte", json!(-5))]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
     fn between_requires_value_end() {
         let body = one_group(vec![input("subscriberCount", "between", json!(3))]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -348,7 +369,10 @@ mod tests {
         let mut c = input("subscriberCount", "between", json!(100));
         c.value_end = Some(json!(10));
         let body = one_group(vec![c]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -364,7 +388,10 @@ mod tests {
     #[test]
     fn country_rejects_bad_code() {
         let body = one_group(vec![input("country", "eq", json!("USA"))]);
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -380,7 +407,10 @@ mod tests {
             grant_on_any: false,
             groups,
         };
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -392,6 +422,9 @@ mod tests {
                 conditions: vec![input("isSubscribed", "eq", json!(true))],
             }],
         };
-        assert!(matches!(parse_rule_tree(body), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            parse_rule_tree(body),
+            Err(AppError::BadRequest(_))
+        ));
     }
 }

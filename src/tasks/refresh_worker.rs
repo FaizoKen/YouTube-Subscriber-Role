@@ -123,7 +123,13 @@ impl CachedInterval {
 pub async fn run(state: Arc<AppState>, worker_id: i64, total_workers: i64) {
     let quota = state.config.youtube_quota_per_day;
     let has_api_key = !state.config.youtube_api_keys.is_empty();
-    tracing::info!(quota, worker_id, total_workers, has_api_key, "Refresh worker started");
+    tracing::info!(
+        quota,
+        worker_id,
+        total_workers,
+        has_api_key,
+        "Refresh worker started"
+    );
 
     let cached = CachedInterval::new(quota);
 
@@ -150,9 +156,7 @@ pub async fn run(state: Arc<AppState>, worker_id: i64, total_workers: i64) {
         }
 
         // 2) Batched channel stats (known channel id, API-key path, 50:1).
-        if has_api_key
-            && process_stats_batch(&state, &cached, worker_id, total_workers).await
-        {
+        if has_api_key && process_stats_batch(&state, &cached, worker_id, total_workers).await {
             continue;
         }
 
@@ -291,8 +295,7 @@ async fn process_one_subscription(
             let changed = result.is_subscribed != was_subscribed;
             let new_streak = if changed { 0 } else { (streak + 1).min(100) };
 
-            let within_fast =
-                (Utc::now() - linked_at).num_seconds() < FAST_RETRY_WINDOW_SECS;
+            let within_fast = (Utc::now() - linked_at).num_seconds() < FAST_RETRY_WINDOW_SECS;
             let interval = if !result.is_subscribed && within_fast {
                 FAST_RETRY_SECS
             } else {
@@ -316,19 +319,28 @@ async fn process_one_subscription(
             .execute(&state.pool)
             .await
             {
-                tracing::error!(discord_id, channel_id, "Failed to update subscription cache: {e}");
+                tracing::error!(
+                    discord_id,
+                    channel_id,
+                    "Failed to update subscription cache: {e}"
+                );
                 return true;
             }
 
             let _ = state
                 .player_sync_tx
-                .send(PlayerSyncEvent::PlayerUpdated { discord_id: discord_id.clone() })
+                .send(PlayerSyncEvent::PlayerUpdated {
+                    discord_id: discord_id.clone(),
+                })
                 .await;
 
             tracing::debug!(
-                discord_id, channel_id,
+                discord_id,
+                channel_id,
                 is_subscribed = result.is_subscribed,
-                is_active, new_streak, interval,
+                is_active,
+                new_streak,
+                interval,
                 "Subscription check complete"
             );
         }
@@ -421,7 +433,11 @@ async fn process_stats_batch(
         return true;
     }
 
-    match state.youtube_client.batch_channel_stats(&api_key, &channel_ids).await {
+    match state
+        .youtube_client
+        .batch_channel_stats(&api_key, &channel_ids)
+        .await
+    {
         Ok(stats_map) => {
             let base = cached.get(&state.pool).await;
             for (discord_id, channel_id, is_active) in &rows {
@@ -434,7 +450,9 @@ async fn process_stats_batch(
                     write_channel_stats(&state.pool, discord_id, stats, next).await;
                     let _ = state
                         .player_sync_tx
-                        .send(PlayerSyncEvent::PlayerUpdated { discord_id: discord_id.clone() })
+                        .send(PlayerSyncEvent::PlayerUpdated {
+                            discord_id: discord_id.clone(),
+                        })
                         .await;
                 } else {
                     // Channel absent from response (deleted/terminated). Keep the
@@ -449,7 +467,11 @@ async fn process_stats_batch(
                     .await;
                 }
             }
-            tracing::debug!(count = rows.len(), fetched = stats_map.len(), "Batched channel stats updated");
+            tracing::debug!(
+                count = rows.len(),
+                fetched = stats_map.len(),
+                "Batched channel stats updated"
+            );
         }
         Err(YouTubeError::QuotaExceeded) => {
             state.quota.mark_exhausted().await;
@@ -585,7 +607,11 @@ async fn process_stats_single(
         return true;
     }
 
-    match state.youtube_client.fetch_channel_stats(&access_token).await {
+    match state
+        .youtube_client
+        .fetch_channel_stats(&access_token)
+        .await
+    {
         Ok(stats) => {
             // Persist the learned channel id so future refreshes batch.
             if let Some(ref cid) = stats.channel_id {
@@ -606,7 +632,9 @@ async fn process_stats_single(
 
             let _ = state
                 .player_sync_tx
-                .send(PlayerSyncEvent::PlayerUpdated { discord_id: discord_id.clone() })
+                .send(PlayerSyncEvent::PlayerUpdated {
+                    discord_id: discord_id.clone(),
+                })
                 .await;
         }
         Err(YouTubeError::QuotaExceeded) => {
@@ -705,7 +733,11 @@ async fn requeue_subscription_after(
     .await;
 }
 
-async fn requeue_stats_after(pool: &sqlx::PgPool, discord_ids: &[String], retry_after: StdDuration) {
+async fn requeue_stats_after(
+    pool: &sqlx::PgPool,
+    discord_ids: &[String],
+    retry_after: StdDuration,
+) {
     let at = Utc::now()
         + Duration::from_std(retry_after).unwrap_or_else(|_| Duration::zero())
         + Duration::seconds((rand::random::<u64>() % 1800) as i64);
@@ -786,8 +818,7 @@ mod tests {
         // 24h cap — i.e. ~16× fewer checks than a volatile user, never exceeding
         // the daily ceiling.
         let base = MIN_REFRESH_SECS;
-        let interval =
-            (base * 1 * stability_factor(100)).clamp(MIN_REFRESH_SECS, MAX_REFRESH_SECS);
+        let interval = (base * 1 * stability_factor(100)).clamp(MIN_REFRESH_SECS, MAX_REFRESH_SECS);
         assert_eq!(interval, MIN_REFRESH_SECS * 16);
         assert!(interval <= MAX_REFRESH_SECS);
     }

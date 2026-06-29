@@ -531,9 +531,7 @@ pub async fn subscribers_data(
     // 1. Require a valid session cookie.
     let session_cookie = jar.get("rl_session").ok_or_else(|| {
         tracing::info!(guild_id, "subscribers_data: no rl_session cookie");
-        AppError::UnauthorizedWith(
-            "No session cookie found. Please log in.".into(),
-        )
+        AppError::UnauthorizedWith("No session cookie found. Please log in.".into())
     })?;
 
     let cookie_value = session_cookie.value();
@@ -544,8 +542,8 @@ pub async fn subscribers_data(
         "<short>".to_string()
     };
 
-    let (viewer_discord_id, _) =
-        verify_session(cookie_value, &state.config.session_secret).ok_or_else(|| {
+    let (viewer_discord_id, _) = verify_session(cookie_value, &state.config.session_secret)
+        .ok_or_else(|| {
             tracing::warn!(
                 guild_id,
                 cookie_len,
@@ -573,8 +571,7 @@ pub async fn subscribers_data(
     .fetch_optional(&state.pool)
     .await?;
 
-    let (has_link, view_permission) =
-        guild_row.unwrap_or((false, "members".to_string()));
+    let (has_link, view_permission) = guild_row.unwrap_or((false, "members".to_string()));
     if !has_link {
         return Err(AppError::NotFound(
             "No subscriber list is configured for this server.".into(),
@@ -590,8 +587,7 @@ pub async fn subscribers_data(
     let members_allowed = view_permission == "members";
 
     // 3. Ask Auth Gateway for guild membership and permissions.
-    let (_, is_manager) =
-        fetch_guild_permission(&state, &guild_id, session_cookie.value()).await?;
+    let (_, is_manager) = fetch_guild_permission(&state, &guild_id, session_cookie.value()).await?;
 
     let (member_ids, ag_guild_name) =
         fetch_guild_members(&state, &guild_id, session_cookie.value()).await?;
@@ -689,8 +685,9 @@ pub async fn subscribers_data(
             let checked_at: Option<chrono::DateTime<chrono::Utc>> = r.get("checked_at");
             let channel_created_at: Option<chrono::DateTime<chrono::Utc>> =
                 r.get("channel_created_at");
-            let hidden_subscribers: bool =
-                r.get::<Option<bool>, _>("hidden_subscribers").unwrap_or(false);
+            let hidden_subscribers: bool = r
+                .get::<Option<bool>, _>("hidden_subscribers")
+                .unwrap_or(false);
             json!({
                 "discord_id": r.get::<String, _>("discord_id"),
                 "discord_name": r.get::<Option<String>, _>("discord_name"),

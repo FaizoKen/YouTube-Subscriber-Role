@@ -29,12 +29,9 @@ const DEFERRED_CHANNEL_STATS_HOURS: i64 = 6;
 
 /// Returns (discord_id, display_name)
 fn get_session(jar: &CookieJar, secret: &str) -> Result<(String, String), AppError> {
-    let cookie = jar
-        .get(SESSION_COOKIE)
-        .ok_or(AppError::Unauthorized)?;
+    let cookie = jar.get(SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
 
-    session::verify_session(cookie.value(), secret)
-        .ok_or(AppError::Unauthorized)
+    session::verify_session(cookie.value(), secret).ok_or(AppError::Unauthorized)
 }
 
 pub fn render_verify_page(base_url: &str) -> String {
@@ -459,10 +456,7 @@ pub async fn verify_page(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 pub async fn login(State(_state): State<Arc<AppState>>) -> Response {
     let return_to = "/youtube-subscriber-role/verify";
-    let url = format!(
-        "/auth/login?return_to={}",
-        urlencoding::encode(return_to),
-    );
+    let url = format!("/auth/login?return_to={}", urlencoding::encode(return_to),);
     Redirect::temporary(&url).into_response()
 }
 
@@ -489,14 +483,12 @@ pub async fn youtube_login(
 
     let expires = chrono::Utc::now() + chrono::Duration::minutes(10);
 
-    sqlx::query(
-        "INSERT INTO oauth_states (state, redirect_data, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(&state_param)
-    .bind(serde_json::json!({"provider": "google"}))
-    .bind(expires)
-    .execute(&state.pool)
-    .await?;
+    sqlx::query("INSERT INTO oauth_states (state, redirect_data, expires_at) VALUES ($1, $2, $3)")
+        .bind(&state_param)
+        .bind(serde_json::json!({"provider": "google"}))
+        .bind(expires)
+        .execute(&state.pool)
+        .await?;
 
     let url = YouTubeClient::google_authorize_url(&state.config, &state_param);
     Ok(Redirect::temporary(&url).into_response())
@@ -511,7 +503,10 @@ pub async fn youtube_callback(
     let (discord_id, display_name) = get_session(&jar, &state.config.session_secret)?;
 
     if query.error.is_some() || query.code.is_none() {
-        return Ok((jar, Redirect::to(&format!("{}/verify", state.config.base_url))));
+        return Ok((
+            jar,
+            Redirect::to(&format!("{}/verify", state.config.base_url)),
+        ));
     }
     let code = query.code.unwrap();
 
@@ -525,7 +520,9 @@ pub async fn youtube_callback(
     .unwrap_or(false);
 
     if !valid {
-        return Err(AppError::BadRequest("Invalid or expired OAuth state".into()));
+        return Err(AppError::BadRequest(
+            "Invalid or expired OAuth state".into(),
+        ));
     }
 
     sqlx::query("DELETE FROM oauth_states WHERE state = $1")
@@ -534,11 +531,17 @@ pub async fn youtube_callback(
         .await?;
 
     // Exchange code for Google tokens
-    let tokens = state.youtube_client.exchange_google_code(&state.config, &code).await
+    let tokens = state
+        .youtube_client
+        .exchange_google_code(&state.config, &code)
+        .await
         .map_err(|e| AppError::Internal(format!("Google token exchange failed: {e}")))?;
 
-    let refresh_token = tokens.refresh_token
-        .ok_or_else(|| AppError::Internal("Google did not return a refresh token. Try unlinking and re-linking.".into()))?;
+    let refresh_token = tokens.refresh_token.ok_or_else(|| {
+        AppError::Internal(
+            "Google did not return a refresh token. Try unlinking and re-linking.".into(),
+        )
+    })?;
 
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(tokens.expires_in);
 
@@ -576,13 +579,12 @@ pub async fn youtube_callback(
     let needs_channel_stats = if guild_ids.is_empty() {
         false
     } else {
-        let trees: Vec<Value> = sqlx::query_scalar(
-            "SELECT rule_tree FROM role_links WHERE guild_id = ANY($1)",
-        )
-        .bind(&guild_ids)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
+        let trees: Vec<Value> =
+            sqlx::query_scalar("SELECT rule_tree FROM role_links WHERE guild_id = ANY($1)")
+                .bind(&guild_ids)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap_or_default();
         // On a DB error we get an empty list → not eager; but the more likely
         // failure (a malformed tree) is handled per-row by defaulting to false.
         trees.iter().any(|raw| {
@@ -664,7 +666,8 @@ pub async fn youtube_callback(
                 }
                 Err(e) => {
                     tracing::warn!(
-                        discord_id, channel_id,
+                        discord_id,
+                        channel_id,
                         "Inline subscription check failed; deferring to worker: {e}"
                     );
                     let _ = sqlx::query(
@@ -686,13 +689,23 @@ pub async fn youtube_callback(
     // role sync below evaluates correctly); otherwise seed a deferred row so the
     // subscribers page fills in later without spending quota during the spike.
     if needs_channel_stats {
-        let granted =
-            matches!(state.quota.acquire(Class::Interactive).await, Outcome::Granted);
-        match (granted, if granted {
-            Some(state.youtube_client.fetch_channel_stats(&tokens.access_token).await)
-        } else {
-            None
-        }) {
+        let granted = matches!(
+            state.quota.acquire(Class::Interactive).await,
+            Outcome::Granted
+        );
+        match (
+            granted,
+            if granted {
+                Some(
+                    state
+                        .youtube_client
+                        .fetch_channel_stats(&tokens.access_token)
+                        .await,
+                )
+            } else {
+                None
+            },
+        ) {
             (true, Some(Ok(stats))) => {
                 // Capture the user's own channel id so the worker can refresh
                 // their stats via the batched (50:1) path from now on.
@@ -731,7 +744,10 @@ pub async fn youtube_callback(
             }
             (_, maybe_err) => {
                 if let Some(Err(e)) = maybe_err {
-                    tracing::warn!(discord_id, "Inline channel stats fetch failed; deferring: {e}");
+                    tracing::warn!(
+                        discord_id,
+                        "Inline channel stats fetch failed; deferring: {e}"
+                    );
                 }
                 // Either the fetch failed or interactive budget was exhausted —
                 // seed a due row for the worker to fill in.
@@ -745,8 +761,7 @@ pub async fn youtube_callback(
             }
         }
     } else {
-        let deferred =
-            chrono::Utc::now() + chrono::Duration::hours(DEFERRED_CHANNEL_STATS_HOURS);
+        let deferred = chrono::Utc::now() + chrono::Duration::hours(DEFERRED_CHANNEL_STATS_HOURS);
         let _ = sqlx::query(
             "INSERT INTO channel_cache (discord_id, next_check_at) VALUES ($1, $2) \
              ON CONFLICT (discord_id) DO NOTHING",
@@ -782,7 +797,10 @@ pub async fn youtube_callback(
 
     tracing::info!(discord_id, "YouTube account linked");
 
-    Ok((jar, Redirect::to(&format!("{}/verify", state.config.base_url))))
+    Ok((
+        jar,
+        Redirect::to(&format!("{}/verify", state.config.base_url)),
+    ))
 }
 
 pub async fn status(
@@ -791,12 +809,11 @@ pub async fn status(
 ) -> Result<Json<Value>, AppError> {
     let (discord_id, display_name) = get_session(&jar, &state.config.session_secret)?;
 
-    let account = sqlx::query_as::<_, (i64,)>(
-        "SELECT id FROM linked_accounts WHERE discord_id = $1",
-    )
-    .bind(&discord_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let account =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM linked_accounts WHERE discord_id = $1")
+            .bind(&discord_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     Ok(Json(json!({
         "discord_id": discord_id,
@@ -821,8 +838,7 @@ pub async fn verify_channels(
     Query(q): Query<VerifyChannelsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let guild_id = q.guild.unwrap_or_default();
-    let valid =
-        (5..=25).contains(&guild_id.len()) && guild_id.bytes().all(|b| b.is_ascii_digit());
+    let valid = (5..=25).contains(&guild_id.len()) && guild_id.bytes().all(|b| b.is_ascii_digit());
     if !valid {
         return Ok(Json(json!({ "channels": [] })));
     }
@@ -844,8 +860,7 @@ pub async fn verify_channels(
 }
 
 pub async fn logout(jar: CookieJar) -> (CookieJar, Json<Value>) {
-    let cookie = Cookie::build(SESSION_COOKIE)
-        .path("/");
+    let cookie = Cookie::build(SESSION_COOKIE).path("/");
     let jar = jar.remove(cookie);
     (jar, Json(json!({"success": true})))
 }
@@ -899,13 +914,12 @@ pub async fn unlink(
 ) -> Result<Json<Value>, AppError> {
     let (discord_id, _) = get_session(&jar, &state.config.session_secret)?;
 
-    let existed = sqlx::query(
-        "DELETE FROM linked_accounts WHERE discord_id = $1",
-    )
-    .bind(&discord_id)
-    .execute(&state.pool)
-    .await?
-    .rows_affected() > 0;
+    let existed = sqlx::query("DELETE FROM linked_accounts WHERE discord_id = $1")
+        .bind(&discord_id)
+        .execute(&state.pool)
+        .await?
+        .rows_affected()
+        > 0;
 
     if !existed {
         return Err(AppError::NotFound("No linked account found".into()));

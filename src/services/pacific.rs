@@ -75,7 +75,10 @@ mod tests {
     fn winter_is_pst() {
         // Jan 15 2026 12:00 UTC → PST (−8) → 04:00 local, same date.
         assert_eq!(pacific_offset_hours(utc(2026, 1, 15, 12)), -8);
-        assert_eq!(pacific_date(utc(2026, 1, 15, 12)), NaiveDate::from_ymd_opt(2026, 1, 15).unwrap());
+        assert_eq!(
+            pacific_date(utc(2026, 1, 15, 12)),
+            NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()
+        );
     }
 
     #[test]
@@ -87,8 +90,14 @@ mod tests {
     #[test]
     fn dst_boundaries_2026() {
         // DST starts 2nd Sun of March 2026 = Mar 8; ends 1st Sun of Nov 2026 = Nov 1.
-        assert_eq!(nth_weekday(2026, 3, Weekday::Sun, 2), NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
-        assert_eq!(nth_weekday(2026, 11, Weekday::Sun, 1), NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        assert_eq!(
+            nth_weekday(2026, 3, Weekday::Sun, 2),
+            NaiveDate::from_ymd_opt(2026, 3, 8).unwrap()
+        );
+        assert_eq!(
+            nth_weekday(2026, 11, Weekday::Sun, 1),
+            NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()
+        );
     }
 
     #[test]

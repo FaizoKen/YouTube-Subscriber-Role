@@ -27,8 +27,8 @@ const BATCH_SIZE: usize = 500;
 async fn main() {
     dotenvy::dotenv().ok();
 
-    let plugin_url = env::var("DATABASE_URL")
-        .expect("DATABASE_URL (YouTube plugin DB) must be set");
+    let plugin_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL (YouTube plugin DB) must be set");
     let gateway_url = env::var("GATEWAY_DATABASE_URL")
         .expect("GATEWAY_DATABASE_URL (Auth Gateway DB) must be set");
 
@@ -97,7 +97,11 @@ async fn migrate_discord_tokens(src: &PgPool, dst: &PgPool) {
 
     let select_sql = format!(
         "SELECT discord_id, refresh_token, guilds_refreshed_at, {ca} FROM discord_tokens",
-        ca = if has_created_at { "created_at" } else { "guilds_refreshed_at AS created_at" },
+        ca = if has_created_at {
+            "created_at"
+        } else {
+            "guilds_refreshed_at AS created_at"
+        },
     );
 
     let rows = sqlx::query(&select_sql)
@@ -114,8 +118,7 @@ async fn migrate_discord_tokens(src: &PgPool, dst: &PgPool) {
         for row in chunk {
             let discord_id: String = row.get("discord_id");
             let refresh_token: String = row.get("refresh_token");
-            let guilds_refreshed_at: chrono::DateTime<chrono::Utc> =
-                row.get("guilds_refreshed_at");
+            let guilds_refreshed_at: chrono::DateTime<chrono::Utc> = row.get("guilds_refreshed_at");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
 
             let result = sqlx::query(
@@ -161,7 +164,11 @@ async fn migrate_user_guilds(src: &PgPool, dst: &PgPool) {
 
     let select_sql = format!(
         "SELECT discord_id, guild_id, {gn}, {mg}, updated_at FROM user_guilds",
-        gn = if has_guild_name { "guild_name" } else { "NULL::text AS guild_name" },
+        gn = if has_guild_name {
+            "guild_name"
+        } else {
+            "NULL::text AS guild_name"
+        },
         mg = if has_manage_guild {
             "manage_guild"
         } else {

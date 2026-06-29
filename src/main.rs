@@ -74,8 +74,12 @@ async fn main() {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("Failed to build OAuth HTTP client");
-    let verify_html = bytes::Bytes::from(routes::verification::render_verify_page(&app_config.base_url));
-    let subscribers_html = bytes::Bytes::from(routes::subscribers::render_subscribers_page(&app_config.base_url));
+    let verify_html = bytes::Bytes::from(routes::verification::render_verify_page(
+        &app_config.base_url,
+    ));
+    let subscribers_html = bytes::Bytes::from(routes::subscribers::render_subscribers_page(
+        &app_config.base_url,
+    ));
 
     let state = Arc::new(AppState {
         pool,
@@ -102,42 +106,75 @@ async fn main() {
             refresh_workers,
         ));
     }
-    tokio::spawn(tasks::player_sync_worker::run(player_sync_rx, Arc::clone(&state)));
-    tokio::spawn(tasks::config_sync_worker::run(config_sync_rx, Arc::clone(&state)));
+    tokio::spawn(tasks::player_sync_worker::run(
+        player_sync_rx,
+        Arc::clone(&state),
+    ));
+    tokio::spawn(tasks::config_sync_worker::run(
+        config_sync_rx,
+        Arc::clone(&state),
+    ));
     tokio::spawn(tasks::cleanup_expired(Arc::clone(&state)));
 
     let app = Router::new()
-        .nest("/youtube-subscriber-role", Router::new()
-            // Plugin endpoints (called by RoleLogic)
-            .route("/register", post(routes::plugin::register))
-            .route("/config", get(routes::plugin::get_config))
-            .route("/config", post(routes::plugin::post_config))
-            .route("/config", delete(routes::plugin::delete_config))
-            // Subscribers list (user-facing, auth via cookie)
-            .route("/subscribers/{guild_id}", get(routes::subscribers::subscribers_page))
-            .route("/subscribers/{guild_id}/data", get(routes::subscribers::subscribers_data))
-            // Admin role-config (iframe UI mode)
-            .route("/admin/{guild_id}/role/{role_id}", get(routes::admin::role_config_page))
-            .route("/admin/{guild_id}/role/{role_id}/data", get(routes::admin::role_config_data))
-            .route("/admin/{guild_id}/role/{role_id}/save", post(routes::admin::role_config_save))
-            .route(
-                "/admin/{guild_id}/role/{role_id}/preview",
-                get(routes::admin::role_config_preview).post(routes::admin::role_config_preview_edit),
-            )
-            .route("/admin/{guild_id}/view-permission", post(routes::admin::set_view_permission))
-            // Verification endpoints (user-facing)
-            .route("/verify", get(routes::verification::verify_page))
-            .route("/verify/channels", get(routes::verification::verify_channels))
-            .route("/verify/login", get(routes::verification::login))
-            .route("/verify/youtube", get(routes::verification::youtube_login))
-            .route("/verify/youtube/callback", get(routes::verification::youtube_callback))
-            .route("/verify/status", get(routes::verification::status))
-            .route("/verify/refresh", post(routes::verification::refresh))
-            .route("/verify/unlink", post(routes::verification::unlink))
-            .route("/verify/logout", post(routes::verification::logout))
-            // Health & static
-            .route("/favicon.ico", get(routes::health::favicon))
-            .route("/health", get(routes::health::health))
+        .nest(
+            "/youtube-subscriber-role",
+            Router::new()
+                // Plugin endpoints (called by RoleLogic)
+                .route("/register", post(routes::plugin::register))
+                .route("/config", get(routes::plugin::get_config))
+                .route("/config", post(routes::plugin::post_config))
+                .route("/config", delete(routes::plugin::delete_config))
+                // Subscribers list (user-facing, auth via cookie)
+                .route(
+                    "/subscribers/{guild_id}",
+                    get(routes::subscribers::subscribers_page),
+                )
+                .route(
+                    "/subscribers/{guild_id}/data",
+                    get(routes::subscribers::subscribers_data),
+                )
+                // Admin role-config (iframe UI mode)
+                .route(
+                    "/admin/{guild_id}/role/{role_id}",
+                    get(routes::admin::role_config_page),
+                )
+                .route(
+                    "/admin/{guild_id}/role/{role_id}/data",
+                    get(routes::admin::role_config_data),
+                )
+                .route(
+                    "/admin/{guild_id}/role/{role_id}/save",
+                    post(routes::admin::role_config_save),
+                )
+                .route(
+                    "/admin/{guild_id}/role/{role_id}/preview",
+                    get(routes::admin::role_config_preview)
+                        .post(routes::admin::role_config_preview_edit),
+                )
+                .route(
+                    "/admin/{guild_id}/view-permission",
+                    post(routes::admin::set_view_permission),
+                )
+                // Verification endpoints (user-facing)
+                .route("/verify", get(routes::verification::verify_page))
+                .route(
+                    "/verify/channels",
+                    get(routes::verification::verify_channels),
+                )
+                .route("/verify/login", get(routes::verification::login))
+                .route("/verify/youtube", get(routes::verification::youtube_login))
+                .route(
+                    "/verify/youtube/callback",
+                    get(routes::verification::youtube_callback),
+                )
+                .route("/verify/status", get(routes::verification::status))
+                .route("/verify/refresh", post(routes::verification::refresh))
+                .route("/verify/unlink", post(routes::verification::unlink))
+                .route("/verify/logout", post(routes::verification::logout))
+                // Health & static
+                .route("/favicon.ico", get(routes::health::favicon))
+                .route("/health", get(routes::health::health)),
         )
         .layer(axum::middleware::from_fn(
             services::security_headers::baseline,

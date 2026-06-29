@@ -81,9 +81,9 @@ fn evaluate_single(condition: &Condition, data: &PlayerYouTubeData) -> bool {
                 }
                 ConditionTarget::ViewCount => data.view_count,
                 ConditionTarget::VideoCount => data.video_count,
-                ConditionTarget::ChannelAgeDays => {
-                    data.channel_created_at.map(|ts| (Utc::now() - ts).num_days())
-                }
+                ConditionTarget::ChannelAgeDays => data
+                    .channel_created_at
+                    .map(|ts| (Utc::now() - ts).num_days()),
                 _ => unreachable!("non-numeric target handled above"),
             };
             let Some(actual) = actual else {

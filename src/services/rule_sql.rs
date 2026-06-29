@@ -82,9 +82,7 @@ fn build_condition(c: &Condition, bind_offset: usize, binds: &mut Vec<Bind>) -> 
         // --- Country is compared case-insensitively (US == us). ---
         (ConditionTarget::Country, Eq) => {
             let i = next(binds);
-            binds.push(Bind::Text(
-                c.value.as_str().unwrap_or("").to_uppercase(),
-            ));
+            binds.push(Bind::Text(c.value.as_str().unwrap_or("").to_uppercase()));
             format!("UPPER(cc.country) = ${i}")
         }
         (ConditionTarget::Country, In) => {
@@ -286,7 +284,12 @@ mod tests {
     fn between_emits_two_binds() {
         let mut c = cond(T::SubscriberCount, Op::Between, json!(100));
         c.value_end = Some(json!(1000));
-        let t = tree(false, vec![ConditionGroup { conditions: vec![c] }]);
+        let t = tree(
+            false,
+            vec![ConditionGroup {
+                conditions: vec![c],
+            }],
+        );
         let (sql, binds) = build_rule_where(&t, 0);
         assert!(sql.contains(">= $1") && sql.contains("<= $2"));
         assert_eq!(binds.len(), 2);

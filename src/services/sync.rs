@@ -56,14 +56,15 @@ pub async fn sync_for_player(discord_id: &str, state: &AppState) -> Result<(), A
 
     // All role links for guilds this user is a member of. Channel may be NULL
     // for channel-agnostic ("anyone who linked") rules.
-    let role_links = sqlx::query_as::<_, (String, String, String, Option<String>, serde_json::Value)>(
-        "SELECT rl.guild_id, rl.role_id, rl.api_token, rl.channel_id, rl.rule_tree \
+    let role_links =
+        sqlx::query_as::<_, (String, String, String, Option<String>, serde_json::Value)>(
+            "SELECT rl.guild_id, rl.role_id, rl.api_token, rl.channel_id, rl.rule_tree \
          FROM role_links rl \
          WHERE rl.guild_id = ANY($1)",
-    )
-    .bind(&guild_ids[..])
-    .fetch_all(pool)
-    .await?;
+        )
+        .bind(&guild_ids[..])
+        .fetch_all(pool)
+        .await?;
 
     if role_links.is_empty() {
         return Ok(());
@@ -90,8 +91,16 @@ pub async fn sync_for_player(discord_id: &str, state: &AppState) -> Result<(), A
     .await?;
 
     enum Action {
-        Add { guild_id: String, role_id: String, api_token: String },
-        Remove { guild_id: String, role_id: String, api_token: String },
+        Add {
+            guild_id: String,
+            role_id: String,
+            api_token: String,
+        },
+        Remove {
+            guild_id: String,
+            role_id: String,
+            api_token: String,
+        },
     }
 
     let mut actions: Vec<Action> = Vec::new();
@@ -259,7 +268,10 @@ pub async fn sync_for_role_link(
     .await?;
 
     if member_ids.is_empty() {
-        match rl_client.upload_users(guild_id, role_id, &[], &api_token).await {
+        match rl_client
+            .upload_users(guild_id, role_id, &[], &api_token)
+            .await
+        {
             Ok(_) => {}
             Err(AppError::RoleLinkNotFound) => {
                 delete_orphan_role_link(guild_id, role_id, pool).await;
@@ -269,24 +281,24 @@ pub async fn sync_for_role_link(
         }
         let mut tx = pool.begin().await?;
         sqlx::query("DELETE FROM role_assignments WHERE guild_id = $1 AND role_id = $2")
-            .bind(guild_id).bind(role_id)
-            .execute(&mut *tx).await?;
+            .bind(guild_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         return Ok(());
     }
 
     // Query the user limit from RoleLogic
-    let (_user_count, user_limit) = match rl_client
-        .get_user_info(guild_id, role_id, &api_token)
-        .await
-    {
-        Ok(v) => v,
-        Err(AppError::RoleLinkNotFound) => {
-            delete_orphan_role_link(guild_id, role_id, pool).await;
-            return Ok(());
-        }
-        Err(_) => (0, 100),
-    };
+    let (_user_count, user_limit) =
+        match rl_client.get_user_info(guild_id, role_id, &api_token).await {
+            Ok(v) => v,
+            Err(AppError::RoleLinkNotFound) => {
+                delete_orphan_role_link(guild_id, role_id, pool).await;
+                return Ok(());
+            }
+            Err(_) => (0, 100),
+        };
 
     // Build the DNF WHERE clause. Fixed binds: $1 = channel_id (empty when the
     // rule is channel-agnostic — subscription conditions then fail closed),
@@ -406,7 +418,9 @@ pub async fn remove_all_assignments(discord_id: &str, state: &AppState) -> Resul
             }
             Err(e) => {
                 tracing::error!(
-                    guild_id, role_id, discord_id,
+                    guild_id,
+                    role_id,
+                    discord_id,
                     "Failed to remove user during unlink: {e}"
                 );
             }

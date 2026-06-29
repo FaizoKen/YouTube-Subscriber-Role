@@ -33,10 +33,12 @@ pub async fn run_migrations(pool: &PgPool) {
         .await
         .expect("Failed to run migration 004");
 
-    sqlx::raw_sql(include_str!("../migrations/005_add_missing_channel_cache_columns.sql"))
-        .execute(pool)
-        .await
-        .expect("Failed to run migration 005");
+    sqlx::raw_sql(include_str!(
+        "../migrations/005_add_missing_channel_cache_columns.sql"
+    ))
+    .execute(pool)
+    .await
+    .expect("Failed to run migration 005");
 
     sqlx::raw_sql(include_str!("../migrations/006_iframe_config.sql"))
         .execute(pool)

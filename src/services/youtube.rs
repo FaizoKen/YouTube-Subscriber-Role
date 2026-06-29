@@ -102,7 +102,10 @@ impl ChannelItem {
                 .and_then(|s| s.published_at.as_deref())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&chrono::Utc)),
-            hidden_subscriber_count: stats.as_ref().and_then(|s| s.hidden_subscriber_count).unwrap_or(false),
+            hidden_subscriber_count: stats
+                .as_ref()
+                .and_then(|s| s.hidden_subscriber_count)
+                .unwrap_or(false),
             country: snippet.as_ref().and_then(|s| s.country.clone()),
             custom_url: snippet.as_ref().and_then(|s| s.custom_url.clone()),
             channel_id: self.id,
@@ -164,7 +167,8 @@ impl YouTubeClient {
                     // 100–400ms × attempt, jittered, to ride out a blip without
                     // synchronizing retries across concurrent callers.
                     let jitter = 100 + (rand::random::<u64>() % 300);
-                    tokio::time::sleep(std::time::Duration::from_millis(jitter * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter * attempt as u64))
+                        .await;
                 }
             }
         }
@@ -250,10 +254,7 @@ impl YouTubeClient {
         let req = self
             .http
             .get("https://www.googleapis.com/youtube/v3/channels")
-            .query(&[
-                ("part", "statistics,snippet"),
-                ("mine", "true"),
-            ])
+            .query(&[("part", "statistics,snippet"), ("mine", "true")])
             .header("Authorization", format!("Bearer {access_token}"));
         let resp = self.send_with_retry(req).await?;
 
@@ -351,10 +352,9 @@ impl YouTubeClient {
             return Err(YouTubeError::ApiError(format!("{status}: {body}")));
         }
 
-        let body: ChannelListResponse = resp
-            .json()
-            .await
-            .map_err(|e| YouTubeError::ApiError(format!("Failed to parse batch channels response: {e}")))?;
+        let body: ChannelListResponse = resp.json().await.map_err(|e| {
+            YouTubeError::ApiError(format!("Failed to parse batch channels response: {e}"))
+        })?;
 
         let mut out = HashMap::with_capacity(channel_ids.len());
         for item in body.items.unwrap_or_default() {
@@ -415,12 +415,15 @@ impl YouTubeClient {
 
         let status = resp.status();
 
-        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED {
+        if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::UNAUTHORIZED
+        {
             let body = resp.text().await.unwrap_or_default();
             if body.contains("invalid_grant") {
                 return Err(YouTubeError::TokenRevoked);
             }
-            return Err(YouTubeError::ApiError(format!("Token refresh failed: {body}")));
+            return Err(YouTubeError::ApiError(format!(
+                "Token refresh failed: {body}"
+            )));
         }
 
         let token_resp: GoogleTokenResponse = resp

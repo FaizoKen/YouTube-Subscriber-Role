@@ -79,8 +79,7 @@ impl AppConfig {
 
         Self {
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
-            google_client_id: env::var("GOOGLE_CLIENT_ID")
-                .expect("GOOGLE_CLIENT_ID must be set"),
+            google_client_id: env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID must be set"),
             google_client_secret: env::var("GOOGLE_CLIENT_SECRET")
                 .expect("GOOGLE_CLIENT_SECRET must be set"),
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),

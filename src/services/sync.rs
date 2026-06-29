@@ -297,7 +297,8 @@ pub async fn sync_for_role_link(
                 delete_orphan_role_link(guild_id, role_id, pool).await;
                 return Ok(());
             }
-            Err(_) => (0, 100),
+            Err(AppError::RoleLinkDisabled) => return Ok(()),
+            Err(e) => return Err(e),
         };
 
     // Build the DNF WHERE clause. Fixed binds: $1 = channel_id (empty when the

@@ -18,6 +18,9 @@ pub fn build_iframe_config(base_url: &str, guild_id: &str, role_id: &str) -> Val
         "name": "YouTube Subscriber Role",
         "description": "Grant Discord roles based on a member's YouTube subscription and their own channel stats — with presets and a full rule builder.",
         "embed_url": embed_url,
+        // We honor read_only impersonation tokens (writes are blocked server-side),
+        // so RoleLogic may hand us a read-only token for viewing.
+        "supports_impersonation_readonly": true,
     })
 }
 

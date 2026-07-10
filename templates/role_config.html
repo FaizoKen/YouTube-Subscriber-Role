@@ -264,7 +264,11 @@ async function load(){
     // Save (after entering the channel ID) applies the sensible default.
     if(state._preset==='unconfigured'){
       state._edit.grant_on_any=false;
-      state._edit.groups=[[c('isSubscribed','eq',true)]];
+      // Canonical group shape is {conditions:[…]} (what applyPreset produces);
+      // the preset `make()` shorthand [[…]] must NOT be assigned raw here or the
+      // save payload sends array-of-arrays and the backend rejects it (HTTP 422)
+      // until the user toggles a preset. Mirror applyPreset('anyone_sub').
+      state._edit.groups=[{conditions:[c('isSubscribed','eq',true)]}];
       state._preset='anyone_sub';
       recomputeDirty();
     }

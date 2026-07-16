@@ -174,6 +174,7 @@ async fn main() {
                 .route("/verify/logout", post(routes::verification::logout))
                 // Health & static
                 .route("/favicon.ico", get(routes::health::favicon))
+                .route("/dweeb/status", get(routes::dweeb::status))
                 .route("/health", get(routes::health::health)),
         )
         .layer(axum::middleware::from_fn(

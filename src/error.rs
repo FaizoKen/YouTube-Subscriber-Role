@@ -59,6 +59,11 @@ pub enum YouTubeError {
     TokenExpired,
     #[error("Google token revoked")]
     TokenRevoked,
+    /// Google refused a sign-in code (`invalid_grant`): it expired, or was
+    /// already spent by a reload or a second tab. The person only has to
+    /// start linking again.
+    #[error("Google rejected the sign-in code")]
+    CodeRejected,
     #[error("YouTube API quota exceeded")]
     QuotaExceeded,
     #[error("YouTube API not found")]

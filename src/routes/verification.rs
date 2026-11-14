@@ -8,7 +8,7 @@ use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::AppError;
+use crate::error::{AppError, YouTubeError};
 use crate::services::quota::{Class, Outcome};
 use crate::services::session;
 use crate::services::sync::{self, PlayerSyncEvent};
@@ -382,6 +382,10 @@ pub fn render_verify_page(base_url: &str) -> String {
                 document.getElementById('yt-discord-badge').textContent = s.display_name;
                 showSection('youtube-section');
             }}
+            // Sent back here because Google refused the sign-in code.
+            if (new URLSearchParams(window.location.search).get('link') === 'retry') {{
+                showMsg('Google sign-in did not finish, so nothing was linked. Press Link YouTube Account to try again.', 'error');
+            }}
             // Session is valid — apply the per-guild side effects (if any).
             applyGuildContext();
         }} catch (e) {{
@@ -531,11 +535,27 @@ pub async fn youtube_callback(
         .await?;
 
     // Exchange code for Google tokens
-    let tokens = state
+    let tokens = match state
         .youtube_client
         .exchange_google_code(&state.config, &code)
         .await
-        .map_err(|e| AppError::Internal(format!("Google token exchange failed: {e}")))?;
+    {
+        Ok(tokens) => tokens,
+        // Nothing is broken and nothing was linked: send them back to the
+        // page to start again, which says why, instead of an error page.
+        Err(YouTubeError::CodeRejected) => {
+            tracing::info!("Google rejected a sign-in code; sending the user back to link again");
+            return Ok((
+                jar,
+                Redirect::to(&format!("{}/verify?link=retry", state.config.base_url)),
+            ));
+        }
+        Err(e) => {
+            return Err(AppError::Internal(format!(
+                "Google token exchange failed: {e}"
+            )))
+        }
+    };
 
     let refresh_token = tokens.refresh_token.ok_or_else(|| {
         AppError::Internal(

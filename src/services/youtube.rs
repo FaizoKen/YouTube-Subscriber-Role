@@ -372,7 +372,7 @@ impl YouTubeClient {
         config: &AppConfig,
         code: &str,
     ) -> Result<GoogleTokens, YouTubeError> {
-        let resp: GoogleTokenResponse = self
+        let resp = self
             .http
             .post("https://oauth2.googleapis.com/token")
             .form(&[
@@ -383,7 +383,23 @@ impl YouTubeClient {
                 ("client_secret", &config.google_client_secret),
             ])
             .send()
-            .await?
+            .await?;
+
+        // Google answers a refused code with an error body, not tokens; read
+        // it as tokens and every refusal turns into a parse error and a 500.
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("invalid_grant") {
+                return Err(YouTubeError::CodeRejected);
+            }
+            let body: String = body.chars().take(300).collect();
+            return Err(YouTubeError::ApiError(format!(
+                "Token exchange failed: {status}: {body}"
+            )));
+        }
+
+        let resp: GoogleTokenResponse = resp
             .json()
             .await
             .map_err(|e| YouTubeError::ApiError(format!("Token exchange parse failed: {e}")))?;
@@ -423,6 +439,15 @@ impl YouTubeClient {
             }
             return Err(YouTubeError::ApiError(format!(
                 "Token refresh failed: {body}"
+            )));
+        }
+        // Anything else (a 5xx or 429 from Google) is temporary: say so,
+        // rather than failing to parse the error page as tokens.
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let body: String = body.chars().take(300).collect();
+            return Err(YouTubeError::ApiError(format!(
+                "Token refresh failed: {status}: {body}"
             )));
         }
 
